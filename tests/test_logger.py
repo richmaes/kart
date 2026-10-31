@@ -18,7 +18,7 @@ def page(index=0, session=1, timestamps=(10000, 20000), version=3):
                      session, index, 100, 4)
     if version == 2:
         struct.pack_into("<I", data, 24, 2000)
-    elif version == 3:
+    elif version >= 3:
         struct.pack_into("<IH", data, 24, 2000, 500)
     for i, timestamp in enumerate(timestamps):
         if version == 1:
@@ -26,9 +26,12 @@ def page(index=0, session=1, timestamps=(10000, 20000), version=3):
         elif version == 2:
             struct.pack_into("<Qiiiiii", data, 32 + i * 32, timestamp,
                              -1, 9806650, 0, 1500000, -2, 0)
-        else:
+        elif version == 3:
             struct.pack_into("<Qhhhhhh", data, 32 + i * 20, timestamp,
                              -1, 500, 0, 100, -2, 0)
+        else:
+            struct.pack_into("<Qhhhhhhh", data, 32 + i * 22, timestamp,
+                             -1, 500, 0, 100, -2, 0, 1024)
     struct.pack_into("<I", data, 4092, zlib.crc32(data[:-4]))
     return bytes(data)
 
@@ -85,6 +88,33 @@ class LoggerTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             decode_page(bytes(data), 0)
 
+    def test_version_4_temperature_and_capacity(self):
+        records = decode_page(page(timestamps=range(1, 185), version=4), 0)
+        self.assertEqual(len(records), 184)
+        self.assertEqual(records[0][-1], 25000000)
+        for raw in (-32767, -512, 0, 32767):
+            buf = bytearray(page(version=4))
+            struct.pack_into("<h", buf, 52, raw)
+            struct.pack_into("<I", buf, 4092, zlib.crc32(buf[:-4]))
+            self.assertEqual(decode_page(buf, 0)[0][-1], round((23 + raw / 512) * 1e6))
+        for offset, value in ((6, 185), (52, -32768)):
+            buf = bytearray(page(version=4))
+            struct.pack_into("<h", buf, offset, value)
+            struct.pack_into("<I", buf, 4092, zlib.crc32(buf[:-4]))
+            with self.assertRaises(ProtocolError):
+                decode_page(buf, 0)
+
+    def test_temperature_csv_with_legacy_rows(self):
+        port = Port(b"BEGIN 2\n" + page(version=3) + page(1, 2, version=4) + b"END\n")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "data.csv"
+            self.assertEqual(download(port, output), (4, 0))
+            with output.open(newline="") as handle:
+                rows = list(csv.reader(handle))
+        self.assertEqual(rows[1][-1], "")
+        self.assertEqual(rows[3][-1], "25.000000")
+        self.assertTrue(all(len(row) == 9 for row in rows))
+
     def test_wrong_accel_scale(self):
         data = bytearray(page())
         struct.pack_into("<H", data, 28, 235)
@@ -120,7 +150,7 @@ class LoggerTests(unittest.TestCase):
                 rows = list(csv.reader(file))
             self.assertEqual(tuple(rows[0]), CSV_HEADER)
             self.assertEqual(rows[1], ["1", "10000", "-0.019613", "9.806650", "0.000000",
-                                       "0.106526", "-0.002131", "0.000000"])
+                                       "0.106526", "-0.002131", "0.000000", ""])
             self.assertEqual(rows[3][0], "2")
             self.assertEqual(len(list(Path(directory).iterdir())), 1)
 
@@ -131,7 +161,7 @@ class LoggerTests(unittest.TestCase):
             self.assertEqual(download(port, output), (4, 0))
             with output.open(newline="") as file:
                 rows = list(csv.reader(file))
-            self.assertEqual(rows[1], ["1", "10000", "-0.000001", "9.806650", "0.000000", "", "", ""])
+            self.assertEqual(rows[1], ["1", "10000", "-0.000001", "9.806650", "0.000000", "", "", "", ""])
             self.assertEqual(rows[3][5], "0.106526")
 
     def test_incomplete_or_invalid_transfer_leaves_no_csv(self):

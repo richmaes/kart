@@ -17,7 +17,7 @@ def page(index=0, session=1, timestamps=(10000, 20000), version=1):
     )
     if version == 2:
         struct.pack_into("<I", buf, 24, 2000)
-    elif version == 3:
+    elif version >= 3:
         struct.pack_into("<IH", buf, 24, 2000, 500)
     for i, timestamp in enumerate(timestamps):
         if version == 1:
@@ -27,11 +27,14 @@ def page(index=0, session=1, timestamps=(10000, 20000), version=1):
                 "<Qiiiiii", buf, 32 + i * 32,
                 timestamp, -1, 9806650, 0, 1500000, -2, 0,
             )
-        else:
+        elif version == 3:
             struct.pack_into(
                 "<Qhhhhhh", buf, 32 + i * 20,
                 timestamp, -1, 500, 0, 100, -2, 0,
             )
+        else:
+            struct.pack_into("<Qhhhhhhh", buf, 32 + i * 22, timestamp,
+                             -1, 500, 0, 100, -2, 0, 1024)
     struct.pack_into("<I", buf, 4092, zlib.crc32(buf[:-4]))
     return bytes(buf)
 

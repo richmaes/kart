@@ -18,13 +18,15 @@ EXTRA = struct.Struct("<IHH")  # gyro_range_dps, accel_counts_per_g, reserved (v
 SAMPLE_V1 = struct.Struct("<Qiii")
 SAMPLE_V2 = struct.Struct("<Qiiiiii")
 SAMPLE_V3 = struct.Struct("<Qhhhhhh")
-MAX_SAMPLES = {1: 203, 2: 126, 3: 203}
+SAMPLE_V4 = struct.Struct("<Qhhhhhhh")
+MAX_SAMPLES = {1: 203, 2: 126, 3: 203, 4: 184}
 ACCEL_COUNTS_PER_G = 500
 GYRO_FULL_SCALE_DPS = 2000
 G_MICRO = 9806650
 CSV_HEADER = (
     "session", "time_us", "ax_m_s2", "ay_m_s2", "az_m_s2",
     "gx_rad_s", "gy_rad_s", "gz_rad_s",
+    "temperature_c",
 )
 
 
@@ -43,10 +45,11 @@ def gyro_micro(counts):
 
 
 def decode_page(page, index):
-    """Return (session, time_us, ax, ay, az, gx, gy, gz) rows.
+    """Return (session, time_us, ax, ay, az, gx, gy, gz[, temperature]) rows.
 
     Accelerations are micro-m/s^2 and angular rates micro-rad/s. The gyroscope
-    values are None for version 1 pages, which have none.
+    values are None for version 1 pages. Version 4 adds micro-degrees Celsius;
+    legacy row tuples retain eight fields. CSV output always has nine columns.
     """
     if len(page) != PAGE_SIZE:
         raise ProtocolError(f"Page {index}: wrong size")
@@ -66,10 +69,10 @@ def decode_page(page, index):
         or rate != 100
         or accel_range != 4
         or (version >= 2 and gyro_range != GYRO_FULL_SCALE_DPS)
-        or (version == 3 and counts_per_g != ACCEL_COUNTS_PER_G)
+        or (version >= 3 and counts_per_g != ACCEL_COUNTS_PER_G)
     ):
         raise ProtocolError(f"Page {index}: invalid or unsupported header")
-    sample = {1: SAMPLE_V1, 2: SAMPLE_V2, 3: SAMPLE_V3}[version]
+    sample = {1: SAMPLE_V1, 2: SAMPLE_V2, 3: SAMPLE_V3, 4: SAMPLE_V4}[version]
     records = []
     previous = None
     for offset in range(count):
@@ -77,8 +80,13 @@ def decode_page(page, index):
         if previous is not None and timestamp <= previous:
             raise ProtocolError(f"Page {index}: non-increasing timestamps")
         previous = timestamp
-        if version == 3:
-            values = [accel_micro(v) for v in values[:3]] + [gyro_micro(v) for v in values[3:]]
+        if version >= 3:
+            temperature = values[6] if version == 4 else None
+            values = [accel_micro(v) for v in values[:3]] + [gyro_micro(v) for v in values[3:6]]
+            if version == 4:
+                if temperature == -32768:
+                    raise ProtocolError(f"Page {index}: invalid BMI270 temperature")
+                values.append(round((23 + temperature / 512) * 1000000))
         elif version == 1:
             values += [None] * 3
         records.append((session, timestamp, *values))
@@ -157,6 +165,8 @@ def download(port, output, skip_invalid=False):
                     continue
                 previous = page_previous
                 for session, timestamp, *values in records:
+                    if len(values) == 6:
+                        values.append(None)
                     writer.writerow((
                         session, timestamp,
                         *("" if v is None else decimal_micro(v) for v in values),

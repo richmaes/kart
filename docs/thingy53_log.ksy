@@ -9,8 +9,9 @@ doc: |
   not parse as this type; test for it before parsing. Parse each page with
   `size: 4096`, and verify `crc32` against the CRC-32/IEEE of the first 4092
   bytes before trusting the content.
-  Version 3 pages (current) carry accelerometer and gyroscope samples as raw
-  16-bit counts; scale them as described in log-format.md. Version 2 (converted
+  Version 4 pages (current) carry raw accelerometer, gyro and BMI270 temperature
+  counts; scale them as described in log-format.md. Version 3 has no temperature.
+  Version 2 (converted
   32-bit values) and version 1 (accelerometer only) pages were written by older
   firmware and may share the same store; the `version` field selects the layout.
 seq:
@@ -23,6 +24,7 @@ seq:
         1: sample_v1
         2: sample_v2
         3: sample_v3
+        4: sample_v4
     repeat: expr
     repeat-expr: header.count
   - id: unused
@@ -33,7 +35,7 @@ seq:
     doc: CRC-32/IEEE (zlib.crc32) of the preceding 4092 bytes of the page.
 instances:
   unused_size:
-    value: 'header.version == 2 ? 28 + (126 - header.count) * 32 : (203 - header.count) * 20'
+    value: 'header.version == 4 ? 12 + (184 - header.count) * 22 : (header.version == 2 ? 28 + (126 - header.count) * 32 : (203 - header.count) * 20)'
 types:
   header:
     seq:
@@ -44,13 +46,13 @@ types:
       - id: version
         type: u2
         valid:
-          any-of: [1, 2, 3]
+          any-of: [1, 2, 3, 4]
       - id: count
         type: u2
         valid:
           min: 1
-          max: 203
-        doc: Number of valid samples in this page (at most 203 for versions 1 and 3, 126 for version 2).
+          max: 'version == 4 ? 184 : (version == 2 ? 126 : 203)'
+        doc: Number of valid samples (203 for v1/v3, 126 for v2, 184 for v4).
       - id: session
         type: u4
         valid:
@@ -69,11 +71,11 @@ types:
       - id: gyro_range_dps
         type: u4
         doc: |
-          Gyroscope full-scale range, +/- deg/s (2000). Versions 2 and 3; in a
+          Gyroscope full-scale range, +/- deg/s (2000). Versions 2..4; in a
           version 1 page these four bytes are erased (0xffffffff).
       - id: accel_counts_per_g
         type: u2
-        doc: Accelerometer counts per g (500). Version 3; erased (0xffff) before.
+        doc: Accelerometer counts per g (500). Versions 3 and 4; erased (0xffff) before.
       - id: reserved
         size: 2
         doc: Left erased (0xff).
@@ -133,3 +135,10 @@ types:
         type: s2
       - id: gz_raw
         type: s2
+  sample_v4:
+    seq:
+      - id: motion
+        type: sample_v3
+      - id: temperature_raw
+        type: s2
+        doc: BMI270 die temperature, Celsius = 23 + raw / 512; -32768 is invalid.

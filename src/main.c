@@ -1,4 +1,5 @@
 #include "button.h"
+#include "imu_temperature.h"
 #include "sensor_raw.h"
 #include "storage.h"
 #include "usb.h"
@@ -64,6 +65,9 @@ static void data_ready(const struct device *dev, const struct sensor_trigger *tr
 	}
 	if (!rc) {
 		rc = sensor_channel_get(imu, SENSOR_CHAN_GYRO_XYZ, gyro);
+	}
+	if (!rc) {
+		rc = imu_temperature_read(&sample.temperature_raw);
 	}
 	if (recording && !atomic_get(&capture_error)) {
 		if (!rc && previous_us && timestamp - previous_us > 15000) {

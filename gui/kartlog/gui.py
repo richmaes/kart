@@ -14,7 +14,7 @@ from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.widgets import SpanSelector  # noqa: E402
 import numpy as np  # noqa: E402
 
-from . import analysis, data, device, sensorcal, synth  # noqa: E402
+from . import analysis, data, device, gyrocal, laps, path, sensorcal, synth  # noqa: E402
 
 RECORDINGS_DIR = Path(__file__).resolve().parent.parent / "recordings"
 DEVICE_COLORS = ("tab:red", "tab:green", "tab:blue")
@@ -35,6 +35,12 @@ class App(tk.Tk):
         self.kart_raw = None
         self.kart = None
         self.source = ""
+        self.laps_by_session = {}
+        self.gyro_intervals_by_session = {}
+        self.gyro_intervals = []
+        self.laps = []
+        self.session_index = None
+        self.span_mode = "reference"
         self.worker_queue = queue.Queue()
         self._pending = None
         self._pending_range = None
@@ -109,6 +115,10 @@ class App(tk.Tk):
             anchor=tk.W, pady=(2, 2))
         ttk.Button(sens, text="Calibrate / check from this session…",
                    command=self.open_calibration).pack(fill=tk.X)
+        ttk.Button(sens, text="Calibration checklist…",
+                   command=self.open_calibration_checklist).pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(sens, text="Gyro / temperature calibration…",
+                   command=self.open_gyro_calibration).pack(fill=tk.X, pady=(4, 0))
         self._refresh_units()
 
         ref = ttk.LabelFrame(frame, text="Reference (at rest = 1 g up)", padding=6)
@@ -173,8 +183,180 @@ class App(tk.Tk):
         self.gg_fig, self.gg_canvas = self._figure_tab(nb, "G-G diagram")
         self.tm_fig, self.tm_canvas = self._figure_tab(nb, "Timing")
         self.ts_axes = self.ts_fig.subplots(3, 1, sharex=True)
+        self._build_laps_tab(nb)
+        self._build_path_tab(nb)
         self.span = None
         return nb
+
+    def _build_path_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=6)
+        notebook.add(tab, text="Apparent path (experimental)")
+        ttk.Label(tab, wraplength=900, justify=tk.LEFT, text=(
+            "Experimental inertial estimate, NOT a track map or racing line. Assume zero "
+            "velocity and no rotation during the initial interval, with the device already "
+            "rigidly mounted. Initial heading is relative to the Forward axis/Yaw trim. "
+            "Bias and tilt errors accumulate rapidly; there is no GPS, distance validation, "
+            "or forced lap closure."
+        )).pack(anchor=tk.W, pady=(0, 6))
+        controls = ttk.Frame(tab)
+        controls.pack(fill=tk.X)
+        ttk.Label(controls, text="Initial stationary seconds").pack(side=tk.LEFT)
+        self.path_rest_var = tk.StringVar(value="3.0")
+        rest_entry = ttk.Entry(controls, textvariable=self.path_rest_var, width=8)
+        rest_entry.pack(side=tk.LEFT, padx=6)
+        self.path_rest_var.trace_add("write", lambda *_args: self._invalidate_path())
+        settling = ttk.Frame(tab)
+        settling.pack(fill=tk.X, pady=4)
+        ttk.Label(settling, text="Startup settling seconds (excluded from bias/tilt fit)").pack(
+            side=tk.LEFT)
+        self.path_settle_var = tk.StringVar(value="1.0")
+        ttk.Entry(settling, textvariable=self.path_settle_var, width=8).pack(side=tk.LEFT, padx=6)
+        self.path_settle_var.trace_add("write", lambda *_args: self._invalidate_path())
+        fusion = ttk.Frame(tab)
+        fusion.pack(fill=tk.X, pady=4)
+        ttk.Label(fusion, text="Orientation estimator").pack(side=tk.LEFT)
+        self.path_fusion_var = tk.StringVar(value="Cautious tilt fusion")
+        fusion_box = ttk.Combobox(
+            fusion, textvariable=self.path_fusion_var,
+            values=("Cautious tilt fusion", "Gyro only"), state="readonly", width=24)
+        fusion_box.pack(side=tk.LEFT, padx=6)
+        fusion_box.bind("<<ComboboxSelected>>", lambda _event: self._invalidate_path())
+        ttk.Label(fusion, text="Temperature compensation").pack(side=tk.LEFT, padx=(8, 0))
+        self.path_temperature_var = tk.StringVar(value="Off")
+        temperature_box = ttk.Combobox(
+            fusion, textvariable=self.path_temperature_var, values=("Off", "Saved per-unit model"),
+            state="readonly", width=20)
+        temperature_box.pack(side=tk.LEFT, padx=4)
+        temperature_box.bind("<<ComboboxSelected>>", lambda _event: self._invalidate_path())
+        self.path_axes = []
+        for name, axis in zip("XYZ", ("-Y", "+X", "+Z")):
+            ttk.Label(controls, text=f"Accel {name} = gyro").pack(side=tk.LEFT, padx=(8, 0))
+            variable = tk.StringVar(value=axis)
+            self.path_axes.append(variable)
+            box = ttk.Combobox(controls, textvariable=variable, values=list(analysis.DEVICE_AXES),
+                               state="readonly", width=4)
+            box.pack(side=tk.LEFT, padx=4)
+            box.bind("<<ComboboxSelected>>", self._path_mapping_changed)
+        ttk.Button(tab, text="Estimate apparent path", command=self.estimate_path).pack(anchor=tk.W)
+        self.path_status = tk.StringVar(value="Load a gyro-enabled session, then estimate using the selected mapping.")
+        ttk.Label(tab, textvariable=self.path_status, wraplength=900, justify=tk.LEFT).pack(
+            anchor=tk.W, pady=6)
+        self.path_fig = Figure(layout="constrained")
+        self.path_canvas = FigureCanvasTkAgg(self.path_fig, master=tab)
+        NavigationToolbar2Tk(self.path_canvas, tab).update()
+        self.path_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _path_mapping_changed(self, _event=None):
+        self._invalidate_path()
+
+    def _invalidate_path(self):
+        if not hasattr(self, "path_fig"):
+            return
+        self.path_fig.clear()
+        self.path_canvas.draw_idle()
+        self.path_status.set("Estimate cleared; click Estimate apparent path using the selected mapping.")
+
+    def estimate_path(self):
+        self._invalidate_path()
+        if self.session is None:
+            self.path_status.set("Load a recording session first.")
+            return
+        try:
+            rest_s = float(self.path_rest_var.get())
+            settle_s = float(self.path_settle_var.get())
+            yaw = float(self.yaw_var.get())
+            if not np.isfinite(yaw):
+                raise ValueError("Yaw trim must be finite")
+            model = None
+            if self.path_temperature_var.get() == "Saved per-unit model":
+                if self.unit_serial in (None, DEMO_UNIT):
+                    raise ValueError("Temperature compensation needs the recording's unit serial")
+                model = gyrocal.Store().model(self.unit_serial)
+                if model is None:
+                    raise ValueError("No fitted temperature model for this unit; collect calibration points first")
+            result = path.estimate(
+                self.session, self.acc, rest_s, self.forward_var.get(), yaw,
+                tuple(variable.get() for variable in self.path_axes), settle_s=settle_s,
+                fuse_tilt=self.path_fusion_var.get() == "Cautious tilt fusion",
+                stationary_intervals=self.gyro_intervals, temperature_model=model)
+        except (ValueError, OSError, KeyError, TypeError, tk.TclError) as exc:
+            self.path_status.set(f"Cannot estimate path: {exc}")
+            messagebox.showerror("Apparent path", str(exc), parent=self)
+            return
+        ax = self.path_fig.add_subplot()
+        positions = result.position[result.rest_end - 1:]
+        times = self.session.t[result.rest_end - 1:] - self.session.t[0]
+        step = max(1, len(times) // GG_MAX_POINTS)
+        ax.plot(positions[:, 0], positions[:, 1], color="gray", lw=0.6)
+        points = ax.scatter(positions[::step, 0], positions[::step, 1],
+                            c=times[::step], cmap="viridis", s=5)
+        self.path_fig.colorbar(points, ax=ax, label="seconds since first sample")
+        ax.scatter([0], [0], marker="o", color="green", label="Start (assumed at rest)")
+        ax.scatter([positions[-1, 0]], [positions[-1, 1]], marker="x", color="red", label="End")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_xlabel("initial forward direction (estimated m)")
+        ax.set_ylabel("initial left direction (estimated m)")
+        ax.set_title("Apparent path — unbounded drift; not a measured course")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+        bias = ", ".join(f"{value:+.4f}" for value in result.gyro_bias)
+        self.path_status.set(
+            f"Initial {rest_s:g} s held at zero velocity. Residual gyro bias in accel axes: [{bias}] rad/s. "
+            f"Bias/tilt fitted over {settle_s:g}–{rest_s:g} s after settling. "
+            f"{self.path_fusion_var.get()}: {result.tilt_corrections} gravity-correction updates. "
+            f"{result.bias_updates} explicit stationary bias updates; temperature: "
+            f"{self.path_temperature_var.get()}. "
+            "Orientation integrated in 3D; gravity removed; velocity/position integrated. "
+            "Gravity does not correct yaw drift. Displayed meters are unvalidated. "
+            "No closure or end-speed correction.")
+        self.path_canvas.draw_idle()
+
+    def _build_laps_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=6)
+        notebook.add(tab, text="Lap comparison")
+        controls = ttk.Frame(tab)
+        controls.pack(fill=tk.X)
+        ttk.Button(controls, text="Select on time series", command=self.mark_lap_range).grid(
+            row=0, column=0, padx=(0, 6))
+        ttk.Label(controls, text="Start (s)").grid(row=0, column=1)
+        self.lap_start_var = tk.StringVar()
+        ttk.Entry(controls, textvariable=self.lap_start_var, width=9).grid(row=0, column=2, padx=4)
+        ttk.Label(controls, text="End (s)").grid(row=0, column=3)
+        self.lap_end_var = tk.StringVar()
+        ttk.Entry(controls, textvariable=self.lap_end_var, width=9).grid(row=0, column=4, padx=4)
+        ttk.Button(controls, text="Add lap", command=self.add_lap).grid(row=0, column=5, padx=4)
+        ttk.Button(controls, text="Update selected", command=self.update_lap).grid(
+            row=0, column=6, padx=4)
+        ttk.Button(controls, text="Remove selected", command=self.remove_lap).grid(
+            row=0, column=7, padx=4)
+        self.lap_mode_var = tk.StringVar(value="elapsed")
+        ttk.Label(controls, text="Align by").grid(row=0, column=8, padx=(12, 2))
+        ttk.Radiobutton(controls, text="Elapsed time", value="elapsed",
+                        variable=self.lap_mode_var, command=self._draw_lap_comparison).grid(
+                            row=0, column=9)
+        ttk.Radiobutton(controls, text="Lap progress", value="progress",
+                        variable=self.lap_mode_var, command=self._draw_lap_comparison).grid(
+                            row=0, column=10)
+
+        columns = ("lap", "start", "end", "duration", "include", "flags")
+        self.lap_tree = ttk.Treeview(tab, columns=columns, show="headings", height=5,
+                                     selectmode="browse")
+        for column, heading, width in (
+            ("lap", "Lap", 55), ("start", "Start (s)", 85), ("end", "End (s)", 85),
+            ("duration", "Duration (s)", 100), ("include", "Overlay", 75),
+            ("flags", "Flags", 260),
+        ):
+            self.lap_tree.heading(column, text=heading)
+            self.lap_tree.column(column, width=width, anchor=tk.CENTER)
+        self.lap_tree.pack(fill=tk.X, pady=(6, 2))
+        self.lap_tree.bind("<<TreeviewSelect>>", self._select_lap)
+        self.lap_tree.bind("<Double-1>", self._toggle_lap)
+
+        self.lap_fig = Figure(layout="constrained")
+        self.lap_axes = self.lap_fig.subplots(3, 1, sharex=True)
+        self.lap_canvas = FigureCanvasTkAgg(self.lap_fig, master=tab)
+        NavigationToolbar2Tk(self.lap_canvas, tab).update()
+        self.lap_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     # ---------- data sources ----------
 
@@ -298,6 +480,11 @@ class App(tk.Tk):
         self.sessions = sessions
         self.source = source
         self.unit_serial = serial
+        self.laps_by_session = {}
+        self.gyro_intervals_by_session = {}
+        self.gyro_intervals = []
+        self.laps = []
+        self.session_index = None
         if serial is None and len(self.store.units) == 1:
             serial = next(iter(self.store.units))
         self.select_unit(serial if serial in self.store.units else None, redraw=False)
@@ -305,6 +492,7 @@ class App(tk.Tk):
         self.session_box["values"] = labels
         if not sessions:
             self.session = None
+            self._invalidate_path()
             self.status_var.set(f"{source}: no samples")
             return
         longest = max(range(len(sessions)), key=lambda i: len(sessions[i].time_us))
@@ -312,12 +500,145 @@ class App(tk.Tk):
         self.select_session()
 
     def select_session(self):
-        self.session = self.sessions[self.session_box.current()]
+        if self.session_index is not None:
+            self.laps_by_session[self.session_index] = self.laps
+            self.gyro_intervals_by_session[self.session_index] = self.gyro_intervals
+        self.session_index = self.session_box.current()
+        self.session = self.sessions[self.session_index]
+        self.laps = self.laps_by_session.get(self.session_index, [])
+        self.gyro_intervals = self.gyro_intervals_by_session.get(self.session_index, [])
         self._apply_sensor_cal()
         self.rate = analysis.sample_rate(self.session.t)
         self.auto_rest(redraw=False)
         self.update_all(reset_view=True)
+        self._refresh_lap_table()
         self._draw_timing()
+
+    def _select_lap(self, _event=None):
+        selected = self.lap_tree.selection()
+        if not selected or self.session is None:
+            return
+        lap = self.laps[int(selected[0])]
+        self.lap_start_var.set(f"{lap.start_us / 1e6:.3f}")
+        self.lap_end_var.set(f"{lap.end_us / 1e6:.3f}")
+
+    def _lap_from_entries(self, include=True):
+        try:
+            start_us = round(float(self.lap_start_var.get()) * 1e6)
+            end_us = round(float(self.lap_end_var.get()) * 1e6)
+        except ValueError as exc:
+            raise ValueError("Enter numeric lap start and end times") from exc
+        return laps.Lap(start_us, end_us, include)
+
+    def add_lap(self):
+        if self.session is None:
+            return
+        try:
+            lap = self._lap_from_entries()
+            laps.validate(self.session, lap, self.laps)
+        except ValueError as exc:
+            messagebox.showerror("Add lap", str(exc))
+            return
+        self.laps.append(lap)
+        self.laps.sort(key=lambda item: item.start_us)
+        self._refresh_lap_table()
+        self._draw_timeseries(reset_view=False)
+        self._draw_lap_comparison()
+
+    def update_lap(self):
+        selected = self.lap_tree.selection()
+        if not selected or self.session is None:
+            return
+        index = int(selected[0])
+        current = self.laps[index]
+        try:
+            updated = self._lap_from_entries(current.include)
+            laps.validate(self.session, updated, self.laps[:index] + self.laps[index + 1:])
+        except ValueError as exc:
+            messagebox.showerror("Update lap", str(exc))
+            return
+        self.laps[index] = updated
+        self.laps.sort(key=lambda item: item.start_us)
+        self._refresh_lap_table()
+        self._draw_timeseries(reset_view=False)
+        self._draw_lap_comparison()
+
+    def remove_lap(self):
+        selected = self.lap_tree.selection()
+        if not selected:
+            return
+        del self.laps[int(selected[0])]
+        self._refresh_lap_table()
+        self._draw_timeseries(reset_view=False)
+        self._draw_lap_comparison()
+
+    def _toggle_lap(self, event):
+        if self.lap_tree.identify_column(event.x) != "#5":
+            return
+        row = self.lap_tree.identify_row(event.y)
+        if not row:
+            return
+        lap = self.laps[int(row)]
+        lap.include = not lap.include
+        self._refresh_lap_table()
+        self._draw_lap_comparison()
+
+    def _refresh_lap_table(self):
+        self.lap_tree.delete(*self.lap_tree.get_children())
+        if self.session is None:
+            return
+        for index, lap in enumerate(self.laps):
+            flags = ", ".join(laps.flags(self.session, lap, self.laps)) or "—"
+            self.lap_tree.insert("", tk.END, iid=str(index), values=(
+                index + 1, f"{lap.start_us / 1e6:.3f}", f"{lap.end_us / 1e6:.3f}",
+                f"{lap.duration_s:.2f}", "✓" if lap.include else "",
+                flags))
+        self._draw_lap_comparison()
+
+    def _draw_lap_comparison(self):
+        if not hasattr(self, "lap_axes"):
+            return
+        for ax in self.lap_axes:
+            ax.clear()
+        included = [(i + 1, lap) for i, lap in enumerate(self.laps) if lap.include]
+        if self.session is None or self.kart is None or not included:
+            self.lap_axes[1].text(0.5, 0.5, "Select laps to compare",
+                                  ha="center", va="center", transform=self.lap_axes[1].transAxes)
+            self.lap_axes[1].set_axis_off()
+            self.lap_canvas.draw_idle()
+            return
+        mode = self.lap_mode_var.get()
+        try:
+            result = laps.comparison(self.session, self.kart, included, mode)
+        except ValueError as exc:
+            self.lap_axes[1].text(0.5, 0.5, str(exc), ha="center", va="center",
+                                  transform=self.lap_axes[1].transAxes)
+            self.lap_canvas.draw_idle()
+            return
+        names = ("longitudinal", "lateral", "vertical")
+        for axis_index, (ax, name) in enumerate(zip(self.lap_axes, names)):
+            for curve_index, (number, x, values) in enumerate(result["curves"]):
+                ax.plot(x, values[:, axis_index], lw=0.8, alpha=0.35,
+                        label=f"Lap {number}" if axis_index == 0 and curve_index < 12 else None)
+            ax.fill_between(result["x"], result["low"][:, axis_index],
+                            result["high"][:, axis_index], color="black", alpha=0.15,
+                            label="25–75% range" if axis_index == 0 else None)
+            ax.plot(result["x"], result["median"][:, axis_index], color="black", lw=1.8,
+                    label="Typical lap (median)" if axis_index == 0 else None)
+            ax.axhline(0, color="gray", lw=0.5)
+            ax.set_ylabel(f"{name} (g)")
+            ax.grid(True, alpha=0.3)
+        if mode == "progress":
+            self.lap_axes[-1].set_xlabel("lap progress (%)")
+            self.lap_axes[-1].set_xlim(0, 1)
+            self.lap_axes[-1].set_xticks(np.linspace(0, 1, 6), labels=[f"{n}%" for n in range(0, 101, 20)])
+        else:
+            self.lap_axes[-1].set_xlabel("elapsed time since lap start (s)")
+        self.lap_axes[0].set_title(
+            f"{len(included)} included lap(s) — {mode} alignment; median template and IQR",
+            loc="left", fontsize=10)
+        self.lap_axes[0].legend(loc="upper right", fontsize=8, ncols=3)
+        self.lap_canvas.draw_idle()
 
     # ---------- sensor calibration ----------
 
@@ -350,6 +671,19 @@ class App(tk.Tk):
         acc = self.session.acc
         self.acc = self.sensor_cal.apply(acc) if self.sensor_cal else acc
 
+    def open_calibration_checklist(self):
+        CalibrationChecklist(self)
+
+    def open_gyro_calibration(self):
+        if self.session is None or self.session.gyro is None:
+            messagebox.showinfo("Gyro calibration", "Load a gyro-enabled recording first.")
+            return
+        try:
+            store = gyrocal.Store()
+            GyroCalibrationDialog(self, store)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            messagebox.showerror("Gyro calibration", str(exc), parent=self)
+
     def open_calibration(self):
         if self.session is None:
             messagebox.showinfo("Calibration", "Load a calibration recording first.")
@@ -376,6 +710,7 @@ class App(tk.Tk):
 
     def update_all(self, reset_view=False):
         self._pending = None
+        self._invalidate_path()
         s = self.session
         if s is None:
             return
@@ -402,7 +737,11 @@ class App(tk.Tk):
                 f"samples = {c.samples}{warn}")
             self.kart_raw = analysis.to_kart_g(self.acc, c)
             self.kart = analysis.smooth(self.kart_raw, self._num(self.smooth_var, 0.25), self.rate)
+        else:
+            self.kart_raw = None
+            self.kart = None
         self._draw_timeseries(reset_view)
+        self._draw_lap_comparison()
 
     def auto_yaw(self):
         if self.session is None or self.cal is None:
@@ -435,12 +774,24 @@ class App(tk.Tk):
 
     def pick_reference(self):
         if self.span:
+            self.span_mode = "reference"
             self.span.set_active(True)
             self.status_var.set("Drag across a stationary section of the top plot")
+
+    def mark_lap_range(self):
+        if self.span:
+            self.span_mode = "lap"
+            self.span.set_active(True)
+            self.status_var.set("Drag across one lap on the Time series tab")
 
     def _on_span(self, xmin, xmax):
         self.span.set_active(False)
         if xmax - xmin < 0.05:
+            return
+        if self.span_mode == "lap":
+            self.lap_start_var.set(f"{xmin:.3f}")
+            self.lap_end_var.set(f"{xmax:.3f}")
+            self.status_var.set(f"Lap range {xmin:.2f}–{xmax:.2f} s; add or update the lap")
             return
         self.ref_start.set(round(xmin, 2))
         self.ref_dur.set(round(xmax - xmin, 2))
@@ -482,6 +833,10 @@ class App(tk.Tk):
 
         start, dur = self._num(self.ref_start, 0.5), self._num(self.ref_dur, 2.0)
         for ax in axes:
+            for lap in self.laps:
+                ax.axvspan(lap.start_us / 1e6, lap.end_us / 1e6,
+                           color="tab:blue" if lap.include else "gray",
+                           alpha=0.08, lw=0)
             ax.axvspan(start, start + dur, color="gold", alpha=0.3, lw=0)
             ax.axhline(0, color="gray", lw=0.5)
             ax.grid(True, alpha=0.3)
@@ -576,6 +931,242 @@ class App(tk.Tk):
         a2.set_xlabel("count")
         a2.sharey(a1)
         self.tm_canvas.draw_idle()
+
+
+class GyroCalibrationDialog(tk.Toplevel):
+    def __init__(self, app, store):
+        super().__init__(app)
+        self.app = app
+        self.store = store
+        self.session = app.session
+        self.title("Gyro / temperature calibration")
+        self.geometry("850x570")
+        self.transient(app)
+        self.grab_set()
+        self.serial = app.unit_serial if app.unit_serial != DEMO_UNIT else None
+        ttk.Label(self, text=f"Recording unit: {self.serial or 'unknown (cannot save/apply per-unit model)'}",
+                  padding=8).pack(fill=tk.X)
+        ttk.Label(self, wraplength=800, justify=tk.LEFT, padding=8, text=(
+            "Mark at least 10 seconds when you KNOW the device was motionless; times are "
+            "seconds after the FIRST SAMPLE, not the session time-series timestamp. "
+            "Quiet IMU data cannot prove zero speed. Allow warm-up and temperature settling. "
+            "Measurements use native gyro axes (rad/s). Marked bias updates affect only "
+            "subsequent samples; they do not reset velocity, position or yaw. "
+            "Use for startup fit assumes rest and zero velocity from sample 0 through End."
+        )).pack(fill=tk.X)
+        controls = ttk.Frame(self, padding=8)
+        controls.pack(fill=tk.X)
+        self.start = tk.StringVar(value="1.0")
+        self.end = tk.StringVar(value="16.0")
+        for label, variable in (("Start (s)", self.start), ("End (s)", self.end)):
+            ttk.Label(controls, text=label).pack(side=tk.LEFT)
+            ttk.Entry(controls, textvariable=variable, width=9).pack(side=tk.LEFT, padx=6)
+        ttk.Button(controls, text="Measure interval", command=self.measure).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Use for startup fit", command=self.use_startup).pack(side=tk.LEFT, padx=6)
+        self.result = tk.StringVar(value="No measurement yet.")
+        ttk.Label(self, textvariable=self.result, justify=tk.LEFT, padding=8).pack(fill=tk.X)
+        actions = ttk.Frame(self, padding=8)
+        actions.pack(fill=tk.X)
+        ttk.Button(actions, text="Save per-unit measurement", command=self.save_measurement).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Use as bias-update interval", command=self.use_interval).pack(side=tk.LEFT, padx=6)
+        ttk.Button(actions, text="Clear session bias updates", command=self.clear_intervals).pack(side=tk.LEFT)
+        self.intervals = tk.StringVar()
+        ttk.Label(self, textvariable=self.intervals, padding=8).pack(fill=tk.X)
+        self.points = ttk.Treeview(self, columns=("temperature", "bias", "noise"), show="headings", height=6)
+        for name in ("temperature", "bias", "noise"):
+            self.points.heading(name, text=name)
+            self.points.column(name, width=260)
+        self.points.pack(fill=tk.BOTH, expand=True, padx=8)
+        footer = ttk.Frame(self, padding=8)
+        footer.pack(fill=tk.X)
+        ttk.Button(footer, text="Fit / save temperature model", command=self.fit).pack(side=tk.LEFT)
+        ttk.Button(footer, text="Delete selected measurement", command=self.delete).pack(side=tk.LEFT, padx=6)
+        ttk.Button(footer, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+        self.refresh()
+
+    def refresh(self):
+        self.points.delete(*self.points.get_children())
+        for index, item in enumerate(self.store.measurements(self.serial)):
+            temperature = "unavailable (legacy)" if item.temperature_c is None else f"{item.temperature_c:.3f} °C"
+            self.points.insert("", tk.END, iid=str(index), values=(
+                temperature, ", ".join(f"{v:+.5f}" for v in item.bias),
+                ", ".join(f"{v:.5f}" for v in item.noise)))
+        self.intervals.set(f"Session bias-update intervals: {self.app.gyro_intervals or 'none'}")
+
+    def measurement(self):
+        serial = self.app.unit_serial if self.app.unit_serial != DEMO_UNIT else None
+        if self.app.session is not self.session or serial != self.serial:
+            raise ValueError("The recording/unit changed; close and reopen this calibration dialog")
+        return gyrocal.measure(self.app.session, self.app.acc,
+                               float(self.start.get()), float(self.end.get()))
+
+    def measure(self):
+        try:
+            item = self.measurement()
+        except ValueError as exc:
+            messagebox.showerror("Stationary measurement", str(exc), parent=self)
+            return
+        self.result.set(
+            f"{item.samples} samples; bias XYZ: {item.bias}\nNoise std XYZ: {item.noise}\n"
+            f"BMI270 temperature: {item.temperature_c if item.temperature_c is not None else 'unavailable'} °C")
+
+    def save_measurement(self):
+        try:
+            self.store.add(self.serial, self.measurement())
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Save gyro measurement", str(exc), parent=self)
+            return
+        self.refresh()
+        self.result.set("Saved measurement. Temperature model is unchanged until Fit / save is clicked.")
+
+    def use_startup(self):
+        try:
+            item = self.measurement()
+            if item.end_s >= self.app.session.duration_s:
+                raise ValueError("Startup fitting needs subsequent samples")
+            if any(start < item.end_s for start, _end in self.app.gyro_intervals):
+                raise ValueError("Startup window would overlap a marked bias update; clear those intervals first")
+        except ValueError as exc:
+            messagebox.showerror("Startup fit", str(exc), parent=self)
+            return
+        self.app.path_settle_var.set(f"{item.start_s:g}")
+        self.app.path_rest_var.set(f"{item.end_s:g}")
+        self.app._invalidate_path()
+        self.result.set("Startup window selected. Ensure the kart was at rest from sample 0 through End.")
+
+    def use_interval(self):
+        try:
+            item = self.measurement()
+            intervals = self.app.gyro_intervals
+            if any(item.start_s < end and start < item.end_s for start, end in intervals):
+                raise ValueError("Bias-update intervals cannot overlap")
+            if item.start_s < float(self.app.path_rest_var.get()):
+                raise ValueError("Bias-update interval must start after initial stationary initialization")
+            if item.end_s >= self.app.session.duration_s:
+                raise ValueError("Bias-update interval needs subsequent samples")
+        except ValueError as exc:
+            messagebox.showerror("Bias-update interval", str(exc), parent=self)
+            return
+        intervals.append((item.start_s, item.end_s))
+        intervals.sort()
+        self.app._invalidate_path()
+        self.refresh()
+
+    def clear_intervals(self):
+        self.app.gyro_intervals.clear()
+        self.app._invalidate_path()
+        self.refresh()
+
+    def fit(self):
+        try:
+            model = self.store.fit(self.serial)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Temperature model", str(exc), parent=self)
+            return
+        self.app._invalidate_path()
+        self.result.set(f"Saved model over {model.temperatures[0]:.2f}–{model.temperatures[-1]:.2f} °C. "
+                        "Choose Saved per-unit model in the path tab to apply it.")
+
+    def delete(self):
+        selection = self.points.selection()
+        if not selection:
+            return
+        try:
+            unit = self.store.units[self.serial]
+            del unit["measurements"][int(selection[0])]
+            unit.pop("model", None)
+            self.store.save()
+        except OSError as exc:
+            messagebox.showerror("Delete measurement", str(exc), parent=self)
+            return
+        self.app._invalidate_path()
+        self.refresh()
+        self.result.set("Measurement deleted; temperature model invalidated. Refit remaining points.")
+
+
+class CalibrationChecklist(tk.Toplevel):
+    """User-confirmed reminders, not device control or automatic verification."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.title("Calibration checklist")
+        self.transient(app)
+        self.geometry("720x680")
+        container = ttk.Frame(self)
+        container.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        body = ttk.Frame(canvas, padding=12)
+        canvas.create_window((0, 0), window=body, anchor=tk.NW)
+        body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        ttk.Label(body, text="Six-face accelerometer calibration", font=("TkDefaultFont", 13, "bold")
+                  ).pack(anchor=tk.W)
+        ttk.Label(body, wraplength=650, justify=tk.LEFT, text=(
+            "Check each item after doing it. This checklist does not control or verify "
+            "the device, and it does not calibrate the gyroscope. Use the top USER button, "
+            "not the separate reset/bootloader button."
+        )).pack(anchor=tk.W, pady=(6, 8))
+        ttk.Label(body, wraplength=650, justify=tk.LEFT, foreground="firebrick", text=(
+            "Erasing is NOT required if there is enough free space: new sessions append to "
+            "existing recordings. If full (-ENOSPC), download and back up anything important "
+            "first. To erase ALL stored recordings, hold the USER button for 5 seconds, "
+            "then release. Keep power connected while blue blinks (up to a minute); wait "
+            "for three quick blue flashes. The device remains stopped. Erase cannot be undone."
+        )).pack(anchor=tk.W, pady=(0, 8))
+
+        steps = [
+            "Prepare: power on, confirm stopped/blue and no red error, and use a stable, "
+            "flat surface. Check Status for free space before recording.",
+            "Start a NEW calibration session: briefly press and release the USER button "
+            "(do not hold it). Confirm the LED turns green.",
+        ]
+        steps.extend(
+            f"Face {number} of 6: {face}. Let the device settle, then leave it completely "
+            "still for at least 5 seconds before turning it."
+            for number, face in enumerate((
+                "top up", "bottom up", "first side up", "opposite side up",
+                "third side up", "remaining opposite side up",
+            ), start=1)
+        )
+        steps.extend([
+            "Stop and flush: briefly press and release the USER button again. Confirm "
+            "blue/stopped; keep power on. If red appears, inspect Status and retry after "
+            "resolving the error.",
+            "Download: connect a USB DATA cable while stopped, close other serial terminals, "
+            "then use Download. Select the new calibration session in the Session list "
+            "(the GUI initially selects the longest session). Download does not erase data.",
+            "Fit and save: open 'Calibrate / check from this session', confirm all six "
+            "distinct faces were detected, press Fit, enter the unit name and serial, "
+            "then Save to calibration file.",
+            "Independent check: record another NEW session, resting still for at least "
+            "5 seconds in each of 2 or 3 orientations. Stop, download, select that session "
+            "and the saved unit calibration, then open Calibrate / check. Each corrected "
+            "|g| should be near 1.000 g. Do not validate using the same six-face fit data.",
+        ])
+        self.checked = []
+        self.progress_var = tk.StringVar()
+        for number, text in enumerate(steps, start=1):
+            checked = tk.BooleanVar(value=False)
+            self.checked.append(checked)
+            row = ttk.Frame(body)
+            row.pack(fill=tk.X, pady=4)
+            ttk.Checkbutton(row, text=f"{number}.", variable=checked,
+                            command=self._update_progress).pack(side=tk.LEFT, anchor=tk.N)
+            ttk.Label(row, text=text, wraplength=590, justify=tk.LEFT).pack(
+                side=tk.LEFT, anchor=tk.N)
+        footer = ttk.Frame(self, padding=12)
+        footer.pack(fill=tk.X)
+        ttk.Label(footer, textvariable=self.progress_var).pack(side=tk.LEFT)
+        ttk.Button(footer, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+        self._update_progress()
+
+    def _update_progress(self):
+        completed = sum(item.get() for item in self.checked)
+        self.progress_var.set(
+            f"{completed} of {len(self.checked)} reminders checked (not device-verified).")
 
 
 class CalibrationDialog(tk.Toplevel):

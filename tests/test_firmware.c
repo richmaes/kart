@@ -69,6 +69,7 @@ static void append(unsigned int count)
 			.time_us = (i + 1) * 10000,
 			.accel = {-1, 500, 0},
 			.gyro = {100, -2, 7},
+			.temperature_raw = 1024,
 		};
 
 		assert(writer_append(&sample) == 0);
@@ -187,6 +188,17 @@ static void test_version_1_pages(void)
 	assert(storage.used == 2 && storage.invalid == 0 && storage.session == 6);
 
 	/* A version 1 page may not claim more samples than it could hold. */
+	sys_put_le16(204, page + 6);
+	sys_put_le32(crc32_ieee(page, LOG_PAGE_SIZE - 4), page + LOG_PAGE_SIZE - 4);
+	assert(storage_init() == 0 && storage.invalid == 1);
+
+	/* Version 3 raw pages remain readable at their original capacity. */
+	sys_put_le16(3, page + 4);
+	sys_put_le16(203, page + 6);
+	sys_put_le32(2000, page + 24);
+	sys_put_le16(500, page + 28);
+	sys_put_le32(crc32_ieee(page, LOG_PAGE_SIZE - 4), page + LOG_PAGE_SIZE - 4);
+	assert(storage_init() == 0 && storage.invalid == 0);
 	sys_put_le16(204, page + 6);
 	sys_put_le32(crc32_ieee(page, LOG_PAGE_SIZE - 4), page + LOG_PAGE_SIZE - 4);
 	assert(storage_init() == 0 && storage.invalid == 1);

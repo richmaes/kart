@@ -75,13 +75,15 @@ complete transfer. There is no USB mass-storage drive to eject.
 Output:
 
 ```csv
-session,time_us,ax_m_s2,ay_m_s2,az_m_s2,gx_rad_s,gy_rad_s,gz_rad_s
-1,10000,0.000000,0.000000,9.806650,0.001500,-0.000200,0.000000
+session,time_us,ax_m_s2,ay_m_s2,az_m_s2,gx_rad_s,gy_rad_s,gz_rad_s,temperature_c
+1,10000,0.000000,0.000000,9.806650,0.001500,-0.000200,0.000000,25.000000
 ```
 
 Acceleration is in **m/s^2**, including gravity, and angular rate is in **rad/s**,
 both to six decimal places (this formatting does not imply that sensor precision).
-Rows recorded by earlier (accelerometer-only) firmware have empty gyroscope fields. `time_us` is the software
+Version 4 also records **BMI270 internal die temperature in Celsius**, not the
+BME688's ambient temperature. Versions 1..3 have empty temperature fields; v1
+also has empty gyroscope fields. `time_us` is the software
 capture time relative to that session's start, not UTC. Session numbers increase
 across starts and reboots until erase. An empty session with no saved samples
 need not survive a reboot. No real-time clock synchronization is implemented.
@@ -103,14 +105,16 @@ Every skipped page is reported; missing data is never silently repaired.
   4 MiB is untouched by the logger. This layout is for this standalone image,
   not for combining with another application's partitions or OTA slots.
 - Append-only, 4096-byte pages, with a versioned header, session ID, physical
-  page index, 203 samples, and CRC32. Each 20-byte sample is a little-endian 64-bit
+  page index, 184 samples, and CRC32. Each 22-byte sample is a little-endian 64-bit
   microsecond timestamp plus three signed 16-bit accelerometer counts and three
-  signed 16-bit gyroscope counts, stored raw; `tools/logger.py` scales them to
-  m/s^2 and rad/s. Pages from earlier firmware (versions 1 and 2) remain readable. The full
+  signed 16-bit gyroscope counts and a signed 16-bit BMI270 temperature, stored raw;
+  `tools/logger.py` scales them to m/s^2, rad/s and Celsius. Twelve padding bytes
+  precede the CRC. Pages from earlier firmware (versions 1..3) remain readable.
+  Upgrading does not require erasing recordings. The full
   byte layout and rules for reading a store are in
   [docs/log-format.md](docs/log-format.md), with a machine-readable Kaitai Struct
   description in [docs/thingy53_log.ksy](docs/thingy53_log.ksy).
-- Approximately **34.6 minutes** total at 100 Hz (**69 minutes** at 50 Hz) when
+- Approximately **31.4 minutes** total at 100 Hz (**62.8 minutes** at 50 Hz) when
   pages are full. Each stop
   closes a page, so many short sessions reduce this duration.
 - Data-ready interrupts drive acquisition, not an approximate software polling
@@ -124,10 +128,16 @@ Every skipped page is reported; missing data is never silently repaired.
   This is **not a lossless FIFO capture implementation**: timestamps represent
   driver callback times and interrupt coalescing cannot always be detected.
   Validate actual timing under the intended hardware/power conditions.
-- Pages are committed every 203 samples (about **2.03 seconds** at 100 Hz) and on stop.
+- Pages are committed every 184 samples (about **1.84 seconds** at 100 Hz) and on stop.
   Sudden power loss can lose the RAM pages not yet written. Torn
   writes are CRC-rejected and their occupied slots are not reused. Always stop
   before removing power if all samples must be saved.
+- Temperature uses an application-local read-only SPI helper because the SDK's
+  BMI270 driver does not expose a temperature channel. Invalid initial temperature
+  (`0x8000`) stops recording with `-ENODATA`; SPI errors are reported through
+  normal capture-error status. No hardware offset, CRT or NVM commands are enabled.
+  Validate temperature readings and actual sample timing on hardware before relying
+  on compensation; the host-side workflow is in [gui/README.md](gui/README.md).
 - Power loss during erase can leave an incompletely erased store. After reboot,
   repeat the full long-press erase before collecting new data.
 - USB transfer is available only while stopped; a stalled transfer is canceled
@@ -137,6 +147,7 @@ Every skipped page is reported; missing data is never silently repaired.
 ## Tests
 
 ```sh
+python3 -m pip install -r gui/requirements.txt
 python3 -m unittest discover -s tests -v
 ```
 
@@ -144,7 +155,10 @@ Tests require Python and a host C compiler (`cc`, e.g. Xcode Command Line Tools
 on macOS). They compile the production storage and button logic against a
 simulated NOR flash and check debounce/hold thresholds, repeated sessions,
 capacity, write/erase/read failures, and reboot recovery. The resulting binary
-page is also decoded by the Python tool to verify format compatibility.
+page is also decoded by the CLI and GUI and round-tripped through CSV to verify
+format compatibility (this cross-check uses the GUI's NumPy/pyserial dependencies).
+SPI temperature tests verify the register, dummy bytes, signed values, access delay,
+invalid sentinel, and propagated I/O errors.
 Host tests cover CRC rejection, session separation, partial serial reads,
 interrupted downloads, explicit salvage, and output-file safety.
 If this Mac's default macOS 27 SDK reports a linker/TAPI architecture mismatch,

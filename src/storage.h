@@ -6,16 +6,19 @@
 
 #define LOG_PAGE_SIZE 4096U
 #define LOG_HEADER_SIZE 32U
-#define LOG_SAMPLE_SIZE 20U
-#define LOG_SAMPLES_PER_PAGE 203U
+#define LOG_SAMPLE_SIZE 22U
+#define LOG_SAMPLES_PER_PAGE 184U
 #define LOG_MAGIC 0x33474c41U /* "ALG3" when read as little-endian bytes */
-#define LOG_VERSION 3U
+#define LOG_VERSION 4U
 /*
  * Older pages stay readable: version 1 (accelerometer only, converted values) and
- * version 2 (accelerometer + gyroscope as converted 32-bit values, 126 per page).
+ * version 2 (converted accelerometer + gyroscope, 126 per page), and version 3
+ * (raw accelerometer + gyroscope, 203 per page).
  */
 #define LOG_VERSION_1 1U
 #define LOG_VERSION_2 2U
+#define LOG_VERSION_3 3U
+#define LOG_V3_SAMPLES_PER_PAGE 203U
 #define LOG_V2_SAMPLES_PER_PAGE 126U
 #define LOG_SAMPLE_RATE_HZ 100U
 #define LOG_RANGE_G 4U
@@ -27,6 +30,7 @@ struct log_sample {
 	uint64_t time_us;
 	int16_t accel[3];
 	int16_t gyro[3];
+	int16_t temperature_raw; /* BMI270: Celsius = 23 + raw / 512. */
 };
 
 /*
@@ -37,13 +41,13 @@ struct log_sample {
 struct __attribute__((packed)) log_page_header {
 	uint32_t magic;
 	uint16_t version;
-	uint16_t count;       /* valid samples in this page, 1..203 */
+	uint16_t count;       /* valid samples in this page, 1..184 */
 	uint32_t session;     /* recording session, starts at 1 */
 	uint32_t page_index;  /* physical slot number of this page */
 	uint32_t sample_rate_hz;
 	uint32_t range_g;
-	uint32_t gyro_range_dps; /* version 2 and 3; erased (0xffffffff) in version 1 */
-	uint16_t accel_counts_per_g; /* version 3 */
+	uint32_t gyro_range_dps; /* versions 2..4; erased (0xffffffff) in version 1 */
+	uint16_t accel_counts_per_g; /* versions 3 and 4 */
 	uint16_t reserved;    /* left erased (0xffff) */
 };
 
@@ -51,11 +55,13 @@ struct __attribute__((packed)) log_sample_record {
 	uint64_t time_us;     /* microseconds since the recording started */
 	int16_t accel_raw[3]; /* x, y, z accelerometer counts */
 	int16_t gyro_raw[3];  /* x, y, z gyroscope counts */
+	int16_t temperature_raw;
 };
 
 struct __attribute__((packed)) log_page_image {
 	struct log_page_header header;
 	struct log_sample_record samples[LOG_SAMPLES_PER_PAGE]; /* unused ones stay 0xff */
+	uint8_t padding[12];  /* left erased */
 	uint32_t crc32;       /* CRC-32/IEEE of all preceding bytes of the page */
 };
 

@@ -27,7 +27,7 @@ static bool valid(const uint8_t *data)
 
 	switch (h->version) {
 	case LOG_VERSION_1:
-		max_count = LOG_SAMPLES_PER_PAGE;
+		max_count = LOG_V3_SAMPLES_PER_PAGE;
 		break;
 	case LOG_VERSION_2:
 		max_count = LOG_V2_SAMPLES_PER_PAGE;
@@ -35,8 +35,9 @@ static bool valid(const uint8_t *data)
 			return false;
 		}
 		break;
+	case LOG_VERSION_3:
 	case LOG_VERSION:
-		max_count = LOG_SAMPLES_PER_PAGE;
+		max_count = h->version == LOG_VERSION ? LOG_SAMPLES_PER_PAGE : LOG_V3_SAMPLES_PER_PAGE;
 		if (h->gyro_range_dps != LOG_GYRO_RANGE_DPS ||
 		    h->accel_counts_per_g != LOG_ACCEL_COUNTS_PER_G) {
 			return false;
@@ -120,6 +121,7 @@ int storage_page_add(struct log_page *p, const struct log_sample *sample)
 	struct log_sample_record *record = &p->image.samples[p->count];
 
 	record->time_us = sample->time_us;
+	record->temperature_raw = sample->temperature_raw;
 	for (int i = 0; i < 3; i++) {
 		record->accel_raw[i] = sample->accel[i];
 		record->gyro_raw[i] = sample->gyro[i];

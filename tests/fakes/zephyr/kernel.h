@@ -20,6 +20,7 @@ typedef int k_timeout_t;
 typedef long atomic_t;
 
 void writer_process_one(void);
+void k_usleep(int32_t microseconds);
 
 static inline long atomic_set(atomic_t *target, long value)
 {

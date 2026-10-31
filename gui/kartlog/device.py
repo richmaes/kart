@@ -18,8 +18,9 @@ SAMPLES = {
     1: struct.Struct("<Qiii"),
     2: struct.Struct("<Qiiiiii"),
     3: struct.Struct("<Qhhhhhh"),
+    4: struct.Struct("<Qhhhhhhh"),
 }
-MAX_SAMPLES = {1: 203, 2: 126, 3: 203}
+MAX_SAMPLES = {1: 203, 2: 126, 3: 203, 4: 184}
 ACCEL_COUNTS_PER_G = 500
 GYRO_RANGE_DPS = 2000
 G_MICRO = 9_806_650
@@ -61,7 +62,7 @@ def decode_page(page, index):
         or rate != 100
         or accel_range != 4
         or (version >= 2 and gyro_range != GYRO_RANGE_DPS)
-        or (version == 3 and counts_per_g != ACCEL_COUNTS_PER_G)
+        or (version >= 3 and counts_per_g != ACCEL_COUNTS_PER_G)
     ):
         raise ProtocolError(f"Page {index}: invalid or unsupported header")
     sample = SAMPLES[version]
@@ -72,10 +73,15 @@ def decode_page(page, index):
         if previous is not None and timestamp <= previous:
             raise ProtocolError(f"Page {index}: non-increasing timestamps")
         previous = timestamp
-        if version == 3:
+        if version >= 3:
+            temperature = values[6] if version == 4 else None
             values = [_accel_micro(value) for value in values[:3]] + [
-                _gyro_micro(value) for value in values[3:]
+                _gyro_micro(value) for value in values[3:6]
             ]
+            if version == 4:
+                if temperature == -32768:
+                    raise ProtocolError(f"Page {index}: invalid BMI270 temperature")
+                values.append(round((23 + temperature / 512) * 1_000_000))
         elif version == 1:
             values += [None] * 3
         records.append((session, timestamp, *values))

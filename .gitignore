@@ -4,4 +4,5 @@ __pycache__/
 /.venv/
 *.csv
 /gui/calibration.json
+/gui/gyro-calibration.json
 /gui/recordings/
