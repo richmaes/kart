@@ -1,0 +1,23 @@
+/* Keep the lower half of the 8 MiB external flash outside the logger. */
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		logger_partition: partition@400000 {
+			label = "accelerometer-log";
+			reg = <0x400000 0x400000>;
+		};
+	};
+};
+
+/* The application uses GPIO LEDs, not the board's PWM LED driver. */
+&pwm0 {
+	status = "disabled";
+};
+
+/* The Thingy:53 BMI270 IMU supplies the gyroscope; it shares the SPI bus with the ADXL362. */
+&bmi270 {
+	status = "okay";
+};
