@@ -79,6 +79,90 @@ nine-column CSVs. Downloads and CSV saves preserve available gyro and BMI270 die
 temperature values; missing legacy values stay blank in mixed recordings.
 Acceleration plots and lap comparison still use acceleration only.
 
+## Track-system lap times
+
+Open **Track lap times** and select the recording session in the toolbar.
+Enter up to **40 consecutive lap durations** as seconds (`42.31`) or
+minutes:seconds (`1:02.310`). Up to three decimal places are accepted; additional
+precision is rejected rather than silently rounded. Leave only unused trailing
+entries blank. The preview shows each duration, cumulative time, total and
+fastest lap. Printed decimal places represent the timing system's reporting resolution,
+not guaranteed measurement accuracy.
+
+Click **Save session lap times** to write `<recording>.laptimes.json` beside the
+CSV. Times are stored as exact integer milliseconds (sidecar version 2), keyed by recording session
+number, separately from unit metadata and sensor calibration. Switching sessions
+retains unfinished edits. **Revert to saved** discards edits for the current
+session; **Clear entries** clears them, and saving commits that removal.
+Opening the CSV again restores its saved times. Keep the sidecar with the CSV
+when moving or sharing it.
+
+**Save CSV** copies the lap times for all sessions (including valid unfinished
+edits) and unit metadata to the new recording's companion files. For demo/in-memory
+data, use Save CSV to persist times. The GUI warns before abandoning unsaved edits
+on closing or loading another recording. Invalid entries or file-write failures
+are reported explicitly.
+
+These durations are **not yet synchronized with sensor timestamps**. Cumulative
+time starts at the timing sequence's arbitrary zero, not sensor recording start.
+Timing laps may extend beyond the captured sensor data; they are not rejected for
+that reason. The manual Lap comparison boundaries remain unchanged. Automatic
+offset matching, physical start-line identification, and visual comparisons
+across multiple sessions/recordings are future work; this page stores the per-session
+timing data needed for them.
+
+Existing version-1 sidecars containing hundredths load automatically as equivalent
+milliseconds (e.g. `4231` becomes `42310`, still 42.31 seconds). The original file
+is not rewritten until saving, which writes version 2. Displayed durations use
+three decimals; that does not imply millisecond accuracy.
+
+### Importing lap times from a photo
+
+On **Track lap times**, click **Import photo...** and select a PNG, JPG or JPEG.
+Recognition stays entirely local; photos are not uploaded, copied into the
+recording folder, or included in calibration files.
+
+1. EXIF orientation is applied automatically. Use **Rotate left/right** if the
+   table is still sideways. Drag a rectangle around **one lap table**, including
+   its kart-number headers and all lap rows. Exclude race summaries/best-times
+   tables, which also contain durations but are not lap sequences.
+2. Click **Read selected table**. Select a detected column from the dropdown;
+   labels suggest a kart number when a numeric header was recognized. Compare
+   that suggestion with the photo rather than treating it as authoritative.
+3. Set **Start lap** and click **Renumber preview**. Printed lap numbers can
+   suggest a starting number only when recognition agrees consistently; missing
+   or ambiguous numbering requires user confirmation. The editable preview has
+   one `lap-number duration` per line. Check every value, row count and order.
+   Low-confidence and malformed tokens are reported; OCR punctuation mistakes
+   such as `22.190.` must be corrected, not silently rounded/repaired.
+4. Click **Import reviewed times into session entries**, confirm, then click
+   **Save session lap times** on the main page to persist them.
+
+**Page-break continuation:** import the first table for the chosen kart (e.g.
+laps 1–18), then reopen the same photo, crop the continuation table and select
+that kart again. Start at lap 19 and merge laps 19–26; earlier entries remain
+unchanged. The importer does not concatenate columns indiscriminately. Preview
+numbers must be consecutive and within 1–40; missing/duplicate/out-of-order
+numbers and holes in the destination are rejected. Import earlier laps first.
+Replacing populated entries requires explicit confirmation.
+
+OCR can entirely miss a printed row or confidently read a wrong digit. Validation
+cannot prove recognition completeness: always compare the preview to the photo.
+Different lighting, skew, folds or table layouts may require a tighter crop or
+manual correction. This feature imports image files, not a live camera feed.
+
+**Local engines:**
+- macOS uses Apple Vision via the included Swift helper. Install Xcode Command
+  Line Tools if Swift is unavailable (`xcode-select --install`).
+- Other platforms use the Tesseract executable on `PATH` (English language data
+  must be installed). On Debian/Ubuntu: `sudo apt install tesseract-ocr`.
+  On Windows, install a local Tesseract distribution and add its executable
+  directory to `PATH`. No Python Tesseract wrapper or cloud account is required.
+
+Pillow is included in the GUI requirements for image loading/cropping. Missing
+engines, unreadable images, OCR failures and timeouts appear as explicit errors;
+there is no silent fallback from native OCR to a different backend.
+
 ## Experimental apparent path
 
 1. Record with the sensor **already rigidly mounted on the kart**. Keep the kart
@@ -108,11 +192,45 @@ for the entire interval. Settling must be shorter than the stationary interval;
 set it to zero to use all initial samples. Error messages show the measured
 variation and the fitting window. This setting does not filter noise during driving.
 
+**Startup acceleration variation limit (g)** defaults to **0.05 g**. Raise it when
+engine vibration in the initial stationary window is known to be benign but would
+otherwise fail startup checks. This only relaxes the startup acceptance gate; it
+does not reduce noise, prove rest, or improve in-run drift behavior. Keep the limit
+as low as practical and avoid using high values to mask real movement.
+
+**Startup gyro variation limit (rad/s)** defaults to **0.03 rad/s**. It is the
+norm of the per-axis standard deviations in the post-settling startup window,
+not the absolute gyro rate or constant bias. Raise it only for known vibration
+while the kart is physically stationary. This does not filter gyro samples,
+change the separate gyro-calibration checks or in-run tilt-fusion gates, or
+correct drift. Changes clear the path estimate; click Estimate again.
+
+**Acceleration low-pass cutoff (Hz; 0 = Off)** controls an offline fourth-order
+Butterworth filter, applied forward/backward to avoid a systematic phase delay.
+Try **5–10 Hz** for vibration suppression, then compare with **0 (Off)**.
+Lower cutoffs suppress more vibration but also flatten real peaks and smear
+transitions; edge effects and pre-event ringing remain possible.
+The cutoff must be below half the sample rate (Nyquist). Timestamp jitter is
+resampled for filtering; gaps over 15 ms split independent segments, each requiring
+at least 16 samples. Invalid settings/data are reported rather than silently bypassed.
+
+Changing the cutoff updates acceleration plots after a short debounce; if a path
+has already been estimated, it is recalculated automatically. **Show unsmoothed
+trace** overlays unfiltered sensor-calibrated data. Existing Display smoothing
+is applied after the low-pass filter, so set Smoothing to 0 to inspect the low-pass
+effect alone. G-G, peaks and lap overlays use the filtered displayed acceleration.
+Path gravity/tilt fitting and integration use low-pass acceleration, but raw
+startup variation/gravity validation and explicit gyro calibration checks remain
+unchanged: filtering must not disguise movement. Gyro samples are not filtered.
+Raw session data and CSV exports are never modified. Filter settings are not
+persisted and default to Off on launch.
+
 The estimator uses the post-settling stationary samples to estimate gravity, tilt and
 gyro bias, holds velocity and position at zero during the entire initial interval, then
 integrates three-dimensional orientation from gyro samples, removes gravity from
 acceleration, and integrates velocity and position with actual timestamp intervals.
-It uses sensor-calibrated acceleration, not the Display smoothing setting.
+It uses sensor-calibrated acceleration with the selected vibration low-pass filter,
+not the Display smoothing setting.
 The plot shows horizontal displacement relative to the initial heading, colored
 by time. No lap closure, final zero-speed constraint, or GPS correction is applied.
 
@@ -140,8 +258,9 @@ in 10 seconds; gyro drift and tilt errors make it worse. Use short runs beginnin
 at rest. Quiet constant motion cannot be distinguished from rest by an IMU, so
 the initial zero-velocity assumption must actually be true. The estimator rejects
 missing/non-finite gyro data, non-increasing timestamps, gaps over 15 ms, incomplete
-initial intervals, and initial noise above 0.05 g or gyro variation above
-0.03 rad/s. It also rejects initial gravity magnitudes more than 10% from 1 g.
+initial intervals, and startup acceleration variation above the configured limit
+(default 0.05 g) or gyro variation above its configured limit (default
+0.03 rad/s). It also rejects initial gravity magnitudes more than 10% from 1 g.
 Those checks do not prove the mounting or stationary assumptions.
 
 Older GUI downloads discarded gyro data. They cannot be used for this feature
@@ -325,6 +444,9 @@ seconds is tilt, not motion.
 - `kartlog/analysis.py` – still-segment finder, installation reference, kart-frame rotation, launch-yaw estimate, peaks
 - `kartlog/path.py` – experimental gyro orientation and acceleration dead reckoning
 - `kartlog/gyrocal.py` – explicit stationary bias/noise measurements, bounded temperature model and per-unit store
+- `kartlog/laptimes.py` – exact timing-system lap durations and per-recording sidecar persistence
+- `kartlog/photo_ocr.py`, `kartlog/photo_import.py` – local OCR, column proposals, crop/review dialog and explicit lap-number merges
+- `kartlog/vision_ocr.swift` – macOS Apple Vision OCR helper
 - `kartlog/sensorcal.py` – per-unit offset/gain fit (sphere or face), check, `calibration.json` store, recording metadata
 - `kartlog/synth.py` – synthetic kart session (**Demo data** button, tests)
 - `kartlog/gui.py` – Tkinter + matplotlib UI

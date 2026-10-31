@@ -14,7 +14,8 @@ from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.widgets import SpanSelector  # noqa: E402
 import numpy as np  # noqa: E402
 
-from . import analysis, data, device, gyrocal, laps, path, sensorcal, synth  # noqa: E402
+from . import analysis, data, device, gyrocal, laps, laptimes, path, sensorcal, synth  # noqa: E402
+from .photo_import import PhotoImportDialog  # noqa: E402
 
 RECORDINGS_DIR = Path(__file__).resolve().parent.parent / "recordings"
 DEVICE_COLORS = ("tab:red", "tab:green", "tab:blue")
@@ -40,6 +41,13 @@ class App(tk.Tk):
         self.gyro_intervals = []
         self.laps = []
         self.session_index = None
+        self.recording_path = None
+        self.external_times = {}
+        self.external_time_drafts = {}
+        self._loading_external_times = False
+        self._path_estimated = False
+        self._filter_pending = None
+        self.filtered_acc = None
         self.span_mode = "reference"
         self.worker_queue = queue.Queue()
         self._pending = None
@@ -61,6 +69,8 @@ class App(tk.Tk):
         body.add(self._build_plots(body), weight=1)
         self.status_var.set("Open a CSV, download from the logger, or load demo data.")
         self.refresh_ports()
+        self._refresh_external_times()
+        self.protocol("WM_DELETE_WINDOW", self._close)
 
     # ---------- layout ----------
 
@@ -184,6 +194,7 @@ class App(tk.Tk):
         self.tm_fig, self.tm_canvas = self._figure_tab(nb, "Timing")
         self.ts_axes = self.ts_fig.subplots(3, 1, sharex=True)
         self._build_laps_tab(nb)
+        self._build_lap_times_tab(nb)
         self._build_path_tab(nb)
         self.span = None
         return nb
@@ -212,6 +223,26 @@ class App(tk.Tk):
         self.path_settle_var = tk.StringVar(value="1.0")
         ttk.Entry(settling, textvariable=self.path_settle_var, width=8).pack(side=tk.LEFT, padx=6)
         self.path_settle_var.trace_add("write", lambda *_args: self._invalidate_path())
+        vibration = ttk.Frame(tab)
+        vibration.pack(fill=tk.X, pady=4)
+        ttk.Label(vibration, text="Startup acceleration variation limit (g)").pack(side=tk.LEFT)
+        self.path_startup_acc_var = tk.StringVar(value="0.05")
+        ttk.Entry(vibration, textvariable=self.path_startup_acc_var, width=8).pack(
+            side=tk.LEFT, padx=6)
+        self.path_startup_acc_var.trace_add("write", lambda *_args: self._invalidate_path())
+        ttk.Label(vibration, text="Acceleration low-pass cutoff (Hz; 0 = Off)").pack(
+            side=tk.LEFT, padx=(12, 0))
+        self.vibration_cutoff_var = tk.StringVar(value="0")
+        ttk.Spinbox(vibration, textvariable=self.vibration_cutoff_var,
+                    from_=0, to=40, increment=0.5, width=8).pack(side=tk.LEFT, padx=6)
+        self.vibration_cutoff_var.trace_add("write", lambda *_args: self._schedule_filter())
+        gyro_limit = ttk.Frame(tab)
+        gyro_limit.pack(fill=tk.X, pady=4)
+        ttk.Label(gyro_limit, text="Startup gyro variation limit (rad/s)").pack(side=tk.LEFT)
+        self.path_startup_gyro_var = tk.StringVar(value="0.03")
+        ttk.Spinbox(gyro_limit, textvariable=self.path_startup_gyro_var,
+                    from_=0.001, to=1, increment=0.01, width=8).pack(side=tk.LEFT, padx=6)
+        self.path_startup_gyro_var.trace_add("write", lambda *_args: self._invalidate_path())
         fusion = ttk.Frame(tab)
         fusion.pack(fill=tk.X, pady=4)
         ttk.Label(fusion, text="Orientation estimator").pack(side=tk.LEFT)
@@ -250,6 +281,7 @@ class App(tk.Tk):
         self._invalidate_path()
 
     def _invalidate_path(self):
+        self._path_estimated = False
         if not hasattr(self, "path_fig"):
             return
         self.path_fig.clear()
@@ -264,6 +296,9 @@ class App(tk.Tk):
         try:
             rest_s = float(self.path_rest_var.get())
             settle_s = float(self.path_settle_var.get())
+            startup_acc_limit = float(self.path_startup_acc_var.get())
+            startup_gyro_limit = float(self.path_startup_gyro_var.get())
+            cutoff = float(self.vibration_cutoff_var.get())
             yaw = float(self.yaw_var.get())
             if not np.isfinite(yaw):
                 raise ValueError("Yaw trim must be finite")
@@ -278,7 +313,10 @@ class App(tk.Tk):
                 self.session, self.acc, rest_s, self.forward_var.get(), yaw,
                 tuple(variable.get() for variable in self.path_axes), settle_s=settle_s,
                 fuse_tilt=self.path_fusion_var.get() == "Cautious tilt fusion",
-                stationary_intervals=self.gyro_intervals, temperature_model=model)
+                stationary_intervals=self.gyro_intervals, temperature_model=model,
+                startup_accel_variation_limit_g=startup_acc_limit,
+                vibration_cutoff_hz=cutoff,
+                startup_gyro_variation_limit_rad_s=startup_gyro_limit)
         except (ValueError, OSError, KeyError, TypeError, tk.TclError) as exc:
             self.path_status.set(f"Cannot estimate path: {exc}")
             messagebox.showerror("Apparent path", str(exc), parent=self)
@@ -303,6 +341,9 @@ class App(tk.Tk):
         self.path_status.set(
             f"Initial {rest_s:g} s held at zero velocity. Residual gyro bias in accel axes: [{bias}] rad/s. "
             f"Bias/tilt fitted over {settle_s:g}–{rest_s:g} s after settling. "
+            f"Startup acceleration variation limit: {startup_acc_limit:g} g. "
+            f"Startup gyro variation limit: {startup_gyro_limit:g} rad/s. "
+            f"Acceleration low-pass: {cutoff:g} Hz (0 = Off). "
             f"{self.path_fusion_var.get()}: {result.tilt_corrections} gravity-correction updates. "
             f"{result.bias_updates} explicit stationary bias updates; temperature: "
             f"{self.path_temperature_var.get()}. "
@@ -310,6 +351,19 @@ class App(tk.Tk):
             "Gravity does not correct yaw drift. Displayed meters are unvalidated. "
             "No closure or end-speed correction.")
         self.path_canvas.draw_idle()
+        self._path_estimated = True
+
+    def _schedule_filter(self):
+        if self._filter_pending:
+            self.after_cancel(self._filter_pending)
+        self._filter_pending = self.after(250, self._update_filter)
+
+    def _update_filter(self):
+        self._filter_pending = None
+        regenerate = self._path_estimated
+        self.update_all()
+        if regenerate and self.filtered_acc is not None:
+            self.estimate_path()
 
     def _build_laps_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=6)
@@ -357,6 +411,167 @@ class App(tk.Tk):
         self.lap_canvas = FigureCanvasTkAgg(self.lap_fig, master=tab)
         NavigationToolbar2Tk(self.lap_canvas, tab).update()
         self.lap_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _build_lap_times_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=8)
+        notebook.add(tab, text="Track lap times")
+        ttk.Label(tab, text=(
+            "Enter timing-system durations in order for the selected session (up to 40). "
+            "Use seconds, e.g. 42.310, or m:ss.cc, e.g. 1:02.310 (up to three decimals). "
+            "Leave unused trailing laps blank.\n"
+            "Printed decimal places are reporting resolution, not guaranteed accuracy. These times are NOT "
+            "aligned to sensor timestamps and do not change manually marked lap boundaries."
+        ), wraplength=1000, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 8))
+        self.external_times_title = tk.StringVar()
+        ttk.Label(tab, textvariable=self.external_times_title).pack(anchor=tk.W)
+        body = ttk.Frame(tab)
+        body.pack(fill=tk.BOTH, expand=True, pady=8)
+        self.external_time_vars = []
+        self.external_time_entries = []
+        for group in range(4):
+            frame = ttk.Frame(body, padding=(0, 0, 12, 0))
+            frame.grid(row=0, column=group, sticky=tk.N)
+            for row in range(10):
+                index = group * 10 + row
+                ttk.Label(frame, text=f"Lap {index + 1}").grid(row=row, column=0, padx=4, pady=4)
+                variable = tk.StringVar()
+                entry = ttk.Entry(frame, textvariable=variable, width=11)
+                entry.grid(row=row, column=1, pady=4)
+                self.external_time_vars.append(variable)
+                self.external_time_entries.append(entry)
+                variable.trace_add("write", lambda *_args: self._external_times_edited())
+        table_frame = ttk.Frame(body)
+        table_frame.grid(row=0, column=4, sticky=tk.NSEW)
+        body.columnconfigure(4, weight=1)
+        body.rowconfigure(0, weight=1)
+        self.external_times_tree = ttk.Treeview(
+            table_frame, columns=("lap", "duration", "total"), show="headings", height=15)
+        for name, title in (("lap", "Lap"), ("duration", "Duration (s)"),
+                            ("total", "Cumulative (s)")):
+            self.external_times_tree.heading(name, text=title)
+            self.external_times_tree.column(name, width=105, anchor=tk.CENTER)
+        scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.external_times_tree.yview)
+        self.external_times_tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.external_times_tree.pack(fill=tk.BOTH, expand=True)
+        actions = ttk.Frame(tab)
+        actions.pack(fill=tk.X)
+        self.external_times_save = ttk.Button(actions, text="Save session lap times",
+                                             command=self.save_external_times)
+        self.external_times_save.pack(side=tk.LEFT)
+        ttk.Button(actions, text="Import photo...", command=self.import_lap_photo).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Revert to saved", command=self._refresh_external_times).pack(
+            side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Clear entries", command=self._clear_external_times).pack(side=tk.LEFT)
+        self.external_times_status = tk.StringVar()
+        ttk.Label(tab, textvariable=self.external_times_status, wraplength=1000,
+                  justify=tk.LEFT).pack(fill=tk.X, pady=8)
+
+    def _external_times_edited(self):
+        if self._loading_external_times:
+            return
+        if self.session is not None:
+            self.external_time_drafts[str(self.session.number)] = [
+                variable.get() for variable in self.external_time_vars]
+        self._preview_external_times()
+
+    def import_lap_photo(self):
+        if self.session is None:
+            messagebox.showinfo("Photo import", "Load a recording session first.", parent=self)
+            return
+        filename = filedialog.askopenfilename(
+            title="Select lap-time photo", filetypes=[("PNG/JPG photos", "*.png *.jpg *.jpeg"),
+                                                     ("All files", "*")])
+        if not filename:
+            return
+        try:
+            PhotoImportDialog(self, filename)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Photo import", str(exc), parent=self)
+
+    def _preview_external_times(self):
+        self.external_times_tree.delete(*self.external_times_tree.get_children())
+        if self.session is None:
+            self.external_times_status.set("Load a recording session first.")
+            return
+        try:
+            values = laptimes.parse_entries([v.get() for v in self.external_time_vars])
+        except ValueError as exc:
+            self.external_times_status.set(f"Cannot save: {exc}")
+            return
+        total = 0
+        for number, value in enumerate(values, 1):
+            total += value
+            self.external_times_tree.insert("", tk.END, values=(
+                number, laptimes.format_time(value), laptimes.format_time(total)))
+        summary = f"{len(values)}/40 laps; total {laptimes.format_time(total)} s."
+        if values:
+            best = min(values)
+            summary += f" Fastest: lap {values.index(best) + 1}, {laptimes.format_time(best)} s."
+        saved = values == self.external_times.get(str(self.session.number), [])
+        summary += " Saved." if saved else " Unsaved changes."
+        summary += (f" Companion file: {laptimes.sidecar(self.recording_path).name}."
+                    if self.recording_path is not None else
+                    " No recording file; use Save CSV to keep lap times on disk.")
+        self.external_times_status.set(summary)
+
+    def _refresh_external_times(self, use_draft=False):
+        number = str(self.session.number) if self.session is not None else None
+        values = ([laptimes.format_time(v) for v in self.external_times.get(number, [])]
+                  if number is not None else [])
+        if use_draft:
+            values = self.external_time_drafts.get(number, values)
+        self._loading_external_times = True
+        try:
+            for index, variable in enumerate(self.external_time_vars):
+                variable.set(values[index] if index < len(values) else "")
+                self.external_time_entries[index].configure(
+                    state="normal" if self.session is not None else "disabled")
+        finally:
+            self._loading_external_times = False
+        if number is not None:
+            self.external_time_drafts[number] = [v.get() for v in self.external_time_vars]
+        self.external_times_title.set(f"Session {number}" if number else "No session selected")
+        self.external_times_save.configure(state="normal" if self.session is not None else "disabled")
+        self._preview_external_times()
+
+    def _clear_external_times(self):
+        for variable in self.external_time_vars:
+            variable.set("")
+
+    def save_external_times(self):
+        if self.session is None:
+            return
+        try:
+            values = laptimes.parse_entries([v.get() for v in self.external_time_vars])
+            saved = dict(self.external_times)
+            saved[str(self.session.number)] = values
+            if self.recording_path is not None:
+                laptimes.save(self.recording_path, saved)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Save lap times", str(exc), parent=self)
+            return
+        self.external_times = saved
+        self._refresh_external_times()
+
+    def _confirm_discard_external_times(self):
+        if self.recording_path is None and any(self.external_times.values()):
+            return messagebox.askyesno(
+                "Unsaved lap times", "These lap times are only in memory. Use Save CSV to keep them.\n"
+                "Discard them before continuing?", parent=self)
+        for number, draft in self.external_time_drafts.items():
+            try:
+                unchanged = laptimes.parse_entries(draft) == self.external_times.get(number, [])
+            except ValueError:
+                unchanged = False
+            if not unchanged:
+                return messagebox.askyesno(
+                    "Unsaved lap times", "Discard unsaved lap-time edits before continuing?", parent=self)
+        return True
+
+    def _close(self):
+        if self._confirm_discard_external_times():
+            self.destroy()
 
     # ---------- data sources ----------
 
@@ -440,7 +655,8 @@ class App(tk.Tk):
             sensorcal.write_meta(path, serial=serial, status=status_line,
                                  downloaded=now.isoformat(timespec="seconds"))
             note = f"; saved {path.name}"
-            self.set_sessions(sessions, path.name, serial)
+            if not self.set_sessions(sessions, path.name, serial, recording_path=path):
+                note += "; current recording kept open"
         self.status_var.set(f"{status_line} — {len(records)} samples{note}")
         if warnings:
             messagebox.showwarning("Download", "\n".join(warnings))
@@ -453,10 +669,13 @@ class App(tk.Tk):
             return
         try:
             sessions = data.load_csv(path)
+            times = laptimes.load(path)
+            meta = sensorcal.read_meta(path)
         except Exception as exc:
             messagebox.showerror("Open CSV", str(exc))
             return
-        self.set_sessions(sessions, Path(path).name, sensorcal.read_meta(path).get("serial"))
+        self.set_sessions(sessions, Path(path).name, meta.get("serial"),
+                          recording_path=Path(path), external_times=times)
 
     def save_csv(self):
         if not self.sessions:
@@ -465,18 +684,43 @@ class App(tk.Tk):
         if not path:
             return
         try:
+            times = dict(self.external_times)
+            for number, draft in self.external_time_drafts.items():
+                try:
+                    times[number] = laptimes.parse_entries(draft)
+                except ValueError as exc:
+                    raise ValueError(f"Session {number}: {exc}") from exc
+            meta = sensorcal.read_meta(self.recording_path) if self.recording_path else {}
+            if self.unit_serial not in (None, DEMO_UNIT):
+                meta["serial"] = self.unit_serial
             Path(path).unlink(missing_ok=True)  # the dialog already confirmed overwrite
             data.save_csv(path, self.sessions)
+            sensorcal.write_meta(path, **meta)
+            laptimes.save(path, times)
         except Exception as exc:
             messagebox.showerror("Save CSV", str(exc))
+            return
+        self.recording_path = Path(path)
+        self.external_times = times
+        self.external_time_drafts = {}
+        self._refresh_external_times()
 
     def load_demo(self):
+        previous_forward, previous_yaw = self.forward_var.get(), self.yaw_var.get()
         self.forward_var.set("+X")
         self.yaw_var.set(0.0)
-        self.set_sessions([synth.synthetic_session()], "demo (device -Y forward, tilted)", DEMO_UNIT)
+        if not self.set_sessions([synth.synthetic_session()],
+                                 "demo (device -Y forward, tilted)", DEMO_UNIT):
+            self.forward_var.set(previous_forward)
+            self.yaw_var.set(previous_yaw)
 
-    def set_sessions(self, sessions, source, serial=None):
+    def set_sessions(self, sessions, source, serial=None, recording_path=None, external_times=None):
         """`serial` is the recording's unit; None means unknown (use the only stored unit)."""
+        if not self._confirm_discard_external_times():
+            return False
+        self.recording_path = recording_path
+        self.external_times = external_times if external_times is not None else {}
+        self.external_time_drafts = {}
         self.sessions = sessions
         self.source = source
         self.unit_serial = serial
@@ -492,12 +736,14 @@ class App(tk.Tk):
         self.session_box["values"] = labels
         if not sessions:
             self.session = None
+            self._refresh_external_times()
             self._invalidate_path()
             self.status_var.set(f"{source}: no samples")
-            return
+            return True
         longest = max(range(len(sessions)), key=lambda i: len(sessions[i].time_us))
         self.session_box.current(longest)
         self.select_session()
+        return True
 
     def select_session(self):
         if self.session_index is not None:
@@ -507,6 +753,7 @@ class App(tk.Tk):
         self.session = self.sessions[self.session_index]
         self.laps = self.laps_by_session.get(self.session_index, [])
         self.gyro_intervals = self.gyro_intervals_by_session.get(self.session_index, [])
+        self._refresh_external_times(use_draft=True)
         self._apply_sensor_cal()
         self.rate = analysis.sample_rate(self.session.t)
         self.auto_rest(redraw=False)
@@ -715,6 +962,27 @@ class App(tk.Tk):
         if s is None:
             return
         try:
+            self.filtered_acc = analysis.vibration_filter(
+                s.t, self.acc, float(self.vibration_cutoff_var.get()))
+        except (ValueError, tk.TclError) as exc:
+            self.filtered_acc = None
+            self.cal = None
+            self.kart_raw = None
+            self.kart = None
+            for ax in self.ts_axes:
+                ax.clear()
+            self.ts_axes[0].text(0.05, 0.5, f"Cannot filter: {exc}", transform=self.ts_axes[0].transAxes)
+            self.ts_canvas.draw_idle()
+            self.gg_fig.clear()
+            self.gg_canvas.draw_idle()
+            self.summary.configure(state=tk.NORMAL)
+            self.summary.delete("1.0", tk.END)
+            self.summary.insert("1.0", f"Cannot filter: {exc}")
+            self.summary.configure(state=tk.DISABLED)
+            self._draw_lap_comparison()
+            self.status_var.set(f"Vibration filter: {exc}")
+            return
+        try:
             self.cal = analysis.calibrate(
                 s.t, self.acc, self._num(self.ref_start, 0.5), self._num(self.ref_dur, 2.0),
                 self.forward_var.get(), self._num(self.yaw_var, 0.0), self.normalize.get())
@@ -736,7 +1004,8 @@ class App(tk.Tk):
                 f"tilt of +Z from up = {c.tilt_deg:.1f}°\n"
                 f"samples = {c.samples}{warn}")
             self.kart_raw = analysis.to_kart_g(self.acc, c)
-            self.kart = analysis.smooth(self.kart_raw, self._num(self.smooth_var, 0.25), self.rate)
+            filtered_kart = analysis.to_kart_g(self.filtered_acc, c)
+            self.kart = analysis.smooth(filtered_kart, self._num(self.smooth_var, 0.25), self.rate)
         else:
             self.kart_raw = None
             self.kart = None
@@ -809,7 +1078,7 @@ class App(tk.Tk):
         t = s.t
         win = self._num(self.smooth_var, 0.25)
         dev = self.acc / analysis.G
-        dev_s = analysis.smooth(dev, win, self.rate)
+        dev_s = analysis.smooth(self.filtered_acc / analysis.G, win, self.rate)
         for i, name in enumerate("xyz"):
             if self.show_raw.get():
                 axes[0].plot(t, dev[:, i], color=DEVICE_COLORS[i], lw=0.4, alpha=0.3)

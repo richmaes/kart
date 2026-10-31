@@ -13,6 +13,39 @@ rotated by a yaw trim. The kart frame is right-handed (ISO 8855 style):
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.signal import butter, sosfiltfilt
+
+
+def vibration_filter(t, acc, cutoff_hz=0.0):
+    """Offline fourth-order Butterworth, forward/backward; never bridge >15 ms gaps."""
+    t = np.asarray(t, dtype=float)
+    acc = np.asarray(acc, dtype=float)
+    if not np.isfinite(cutoff_hz) or cutoff_hz < 0:
+        raise ValueError("Vibration cutoff must be finite and non-negative (0 means Off)")
+    if cutoff_hz == 0:
+        return acc.copy()
+    if (t.ndim != 1 or acc.shape != (len(t), 3) or len(t) < 2
+            or not np.isfinite(t).all() or not np.isfinite(acc).all()
+            or np.any(np.diff(t) <= 0)):
+        raise ValueError("Vibration filter needs finite XYZ samples and increasing timestamps")
+    result = np.empty_like(acc)
+    boundaries = np.r_[0, np.flatnonzero(np.diff(t) > 0.0150001) + 1, len(t)]
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        times = t[start:end]
+        if len(times) < 16:
+            raise ValueError("Vibration filter needs at least 16 samples in each gap-free segment")
+        rate = sample_rate(times)
+        if cutoff_hz >= rate / 2:
+            raise ValueError(f"Vibration cutoff must be below Nyquist ({rate / 2:.2f} Hz)")
+        # Resample timestamp jitter for the fixed-rate filter, retaining original output times.
+        grid = np.linspace(times[0], times[-1], len(times))
+        rate = (len(grid) - 1) / (grid[-1] - grid[0])
+        if cutoff_hz >= rate / 2:
+            raise ValueError(f"Vibration cutoff must be below Nyquist ({rate / 2:.2f} Hz)")
+        uniform = np.column_stack([np.interp(grid, times, axis) for axis in acc[start:end].T])
+        filtered = sosfiltfilt(butter(4, cutoff_hz, fs=rate, output="sos"), uniform, axis=0)
+        result[start:end] = np.column_stack([np.interp(times, grid, axis) for axis in filtered.T])
+    return result
 
 G = 9.80665
 SAMPLE_RATE_HZ = 100

@@ -59,7 +59,9 @@ def _gravity_correction(orientation, measured, gravity_norm, noise_g, angular_ra
 
 def estimate(session: Session, acc, rest_s=3.0, forward_axis="+X", yaw_deg=0.0,
              axes=("+X", "+Y", "+Z"), settle_s=1.0, fuse_tilt=True,
-             stationary_intervals=(), temperature_model=None):
+             stationary_intervals=(), temperature_model=None,
+             startup_accel_variation_limit_g=0.05, vibration_cutoff_hz=0.0,
+             startup_gyro_variation_limit_rad_s=0.03):
     acc = np.asarray(acc, dtype=float)
     if forward_axis not in analysis.DEVICE_AXES or not np.isfinite(yaw_deg):
         raise ValueError("Choose a valid Forward axis and finite Yaw trim")
@@ -71,6 +73,12 @@ def estimate(session: Session, acc, rest_s=3.0, forward_axis="+X", yaw_deg=0.0,
         raise ValueError("Missing/non-finite sensor samples: select a complete gyro-enabled session")
     if len(acc) < 3 or not np.isfinite(rest_s) or rest_s <= 0:
         raise ValueError("Choose a positive stationary duration with at least three samples")
+    if (not np.isfinite(startup_accel_variation_limit_g)
+            or startup_accel_variation_limit_g <= 0):
+        raise ValueError("Startup acceleration-variation limit must be a positive finite number")
+    if (not np.isfinite(startup_gyro_variation_limit_rad_s)
+            or startup_gyro_variation_limit_rad_s <= 0):
+        raise ValueError("Startup gyro-variation limit must be a positive finite number")
     dt_us = np.diff(session.time_us)
     if np.any(dt_us <= 0):
         raise ValueError("Timestamps must be strictly increasing")
@@ -97,14 +105,17 @@ def estimate(session: Session, acc, rest_s=3.0, forward_axis="+X", yaw_deg=0.0,
     acc_std_g = float(np.linalg.norm(stationary_acc.std(axis=0)) / analysis.G)
     gyro_std = float(np.linalg.norm(stationary_gyro.std(axis=0)))
     window = f"{settle_s:g}–{rest_s:g} s"
-    if acc_std_g > 0.05:
+    if acc_std_g > startup_accel_variation_limit_g:
         raise ValueError(f"Stationary window {window}: acceleration variation {acc_std_g:.4f} g "
-                         "exceeds 0.05 g; keep the mounted kart still")
-    if gyro_std > 0.03:
+                         f"exceeds {startup_accel_variation_limit_g:.4f} g; keep the mounted kart still")
+    if gyro_std > startup_gyro_variation_limit_rad_s:
         raise ValueError(f"Stationary window {window}: gyro variation {gyro_std:.5f} rad/s "
-                         "exceeds 0.03 rad/s; keep the kart still")
+                         f"exceeds {startup_gyro_variation_limit_rad_s:g} rad/s; keep the kart still")
     if abs(np.linalg.norm(stationary_acc.mean(axis=0)) / analysis.G - 1.0) > 0.1:
         raise ValueError("Initial gravity magnitude differs from 1 g by >10%; check sensor calibration")
+    raw_acc = acc
+    acc = analysis.vibration_filter(elapsed, acc, vibration_cutoff_hz)
+    stationary_acc = acc[start:end]
     cal = analysis.calibrate(elapsed, acc, settle_s, rest_s - settle_s, forward_axis, yaw_deg)
     bias = stationary_gyro.mean(axis=0)
     gyro = gyro - bias
@@ -113,7 +124,7 @@ def estimate(session: Session, acc, rest_s=3.0, forward_axis="+X", yaw_deg=0.0,
     for interval_start, interval_end in sorted(stationary_intervals):
         if interval_start < last_end:
             raise ValueError("Marked stationary intervals must not overlap initialization or each other")
-        gyrocal.measure(session, acc, interval_start, interval_end)
+        gyrocal.measure(session, raw_acc, interval_start, interval_end)
         first = int(np.searchsorted(elapsed, interval_start))
         last = int(np.searchsorted(elapsed, interval_end, side="right"))
         if last >= len(acc):

@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 /.venv/
 *.csv
+*.laptimes.json
 /gui/calibration.json
 /gui/gyro-calibration.json
 /gui/recordings/

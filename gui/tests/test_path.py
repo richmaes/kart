@@ -47,11 +47,43 @@ class PathTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "gyro variation .*exceeds 0.03"):
             path.estimate(session, session.acc)
 
+    def test_startup_acceleration_variation_limit_is_configurable(self):
+        session = self.session()
+        session.acc[:300, 0] = np.sin(np.linspace(0, 30 * np.pi, 300)) * 0.8
+        with self.assertRaisesRegex(ValueError, "acceleration variation .*exceeds 0.0500 g"):
+            path.estimate(session, session.acc)
+        result = path.estimate(session, session.acc, startup_accel_variation_limit_g=0.08)
+        self.assertEqual(result.position.shape, session.acc.shape)
+        for limit in (0, -0.1, float("nan")):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                path.estimate(session, session.acc, startup_accel_variation_limit_g=limit)
+
     def test_invalid_settling_intervals(self):
         session = self.session()
         for settling in (-1, 3, 4, float("nan"), 2.999):
             with self.subTest(settling=settling), self.assertRaises(ValueError):
                 path.estimate(session, session.acc, settle_s=settling)
+
+    def test_startup_gyro_variation_limit_is_configurable(self):
+        session = self.session()
+        session.gyro[:, 0] = 0.2  # Constant bias alone is not variation.
+        path.estimate(session, session.acc)
+        session.gyro[100:301, 0] += np.where(np.arange(201) % 2, 0.04, -0.04)
+        measured = float(np.linalg.norm(session.gyro[100:301].std(axis=0)))
+        with self.assertRaisesRegex(ValueError, "gyro variation .*exceeds 0.03 rad/s"):
+            path.estimate(session, session.acc)
+        result = path.estimate(session, session.acc, startup_gyro_variation_limit_rad_s=0.05)
+        self.assertEqual(result.position.shape, session.acc.shape)
+        path.estimate(session, session.acc, startup_gyro_variation_limit_rad_s=measured)
+        with self.assertRaisesRegex(ValueError, "gyro variation"):
+            path.estimate(session, session.acc,
+                          startup_gyro_variation_limit_rad_s=np.nextafter(measured, 0))
+        for limit in (0, -0.1, np.nan, np.inf):
+            with self.subTest(limit=limit), self.assertRaisesRegex(ValueError, "positive finite"):
+                path.estimate(session, session.acc, startup_gyro_variation_limit_rad_s=limit)
+        session.acc[:301:2, 0] = 2
+        with self.assertRaisesRegex(ValueError, "acceleration variation"):
+            path.estimate(session, session.acc, startup_gyro_variation_limit_rad_s=0.05)
 
     def test_rotation_tracks_gravity_without_false_translation(self):
         session = self.session()
