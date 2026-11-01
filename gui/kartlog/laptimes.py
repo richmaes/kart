@@ -50,7 +50,7 @@ def sidecar(csv_path):
 
 
 def validate(payload):
-    if not isinstance(payload, dict) or payload.get("version") not in (1, 2):
+    if not isinstance(payload, dict) or payload.get("version") not in (1, 2, 3):
         raise ValueError("Unsupported lap-times file version")
     sessions = payload.get("sessions")
     if not isinstance(sessions, dict):
@@ -62,6 +62,19 @@ def validate(payload):
                 or any(type(value) is not int or value <= 0 for value in values)):
             raise ValueError(f"Session {number}: expected up to {MAX_LAPS} positive integer durations")
     factor = 10 if payload["version"] == 1 else 1
+    alignments = payload.get("alignments", {})
+    if not isinstance(alignments, dict):
+        raise ValueError("Lap-times alignments must be an object")
+    for number, saved in alignments.items():
+        if (number not in sessions or not isinstance(saved, dict)
+                or type(saved.get("offset_us")) is not int
+                or not isinstance(saved.get("durations_ms"), list)
+                or len(saved["durations_ms"]) < 2
+                or any(type(value) is not int for value in saved["durations_ms"])
+                or saved.get("durations_ms") != sessions[number]
+                or not isinstance(saved.get("timestamps_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", saved["timestamps_sha256"]) is None):
+            raise ValueError(f"Session {number}: invalid or stale saved alignment")
     return {number: [value * factor for value in values] for number, values in sessions.items()}
 
 
@@ -72,8 +85,27 @@ def load(csv_path):
     return validate(json.loads(filename.read_text(encoding="ascii")))
 
 
-def save(csv_path, sessions):
-    payload = {"version": 2, "sessions": sessions}
+def load_alignments(csv_path):
+    filename = sidecar(csv_path)
+    if not filename.exists():
+        return {}
+    payload = json.loads(filename.read_text(encoding="ascii"))
+    validate(payload)
+    return payload.get("alignments", {})
+
+
+def save(csv_path, sessions, alignments=None):
+    if alignments is None:
+        alignments = {}
+    if (not isinstance(alignments, dict)
+            or any(not isinstance(saved, dict) or "durations_ms" not in saved
+                   for saved in alignments.values())):
+        raise ValueError("Invalid lap-times alignments")
+    alignments = {number: saved for number, saved in alignments.items()
+                  if saved["durations_ms"] == sessions.get(number)}
+    payload = {"version": 3 if alignments else 2, "sessions": sessions}
+    if alignments:
+        payload["alignments"] = alignments
     validate(payload)
     filename = sidecar(csv_path)
     temporary = None

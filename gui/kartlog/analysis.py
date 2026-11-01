@@ -203,6 +203,76 @@ def estimate_launch_yaw(t, kart_g, after_s, threshold_g=0.12, hold_s=0.3, window
     raise ValueError("No sustained acceleration found after the reference window")
 
 
+def inspect_launch(t, acc, ref_start, ref_duration, threshold_g=0.12, hold_s=0.3,
+                   window_s=1.0):
+    """Detect a candidate push, independent of the current forward-axis setting."""
+    t, acc = np.asarray(t), np.asarray(acc)
+    if (t.ndim != 1 or acc.shape != (len(t), 3) or len(t) < 2
+            or not np.isfinite(t).all() or not np.isfinite(acc).all()
+            or np.any(np.diff(t) <= 0)):
+        raise ValueError("Launch inspection needs finite XYZ samples and increasing timestamps")
+    if (not np.isfinite([ref_start, ref_duration, threshold_g, hold_s, window_s]).all()
+            or min(ref_duration, threshold_g, hold_s, window_s) <= 0):
+        raise ValueError("Reference duration, threshold, hold and averaging time must be positive and finite")
+    mask = window_mask(t, ref_start, ref_duration)
+    if mask.sum() < 2:
+        raise ValueError("Select a stationary reference containing at least two samples")
+    reference = acc[mask].mean(axis=0)
+    magnitude = np.linalg.norm(reference)
+    if magnitude < 0.2 * G:
+        raise ValueError("Reference has no clear gravity vector")
+    if np.any(np.diff(t[mask]) > 0.0150001):
+        raise ValueError("Stationary reference crosses a recording gap")
+    up = reference / magnitude
+    delta = (acc - reference) / G
+    horizontal = delta - (delta @ up)[:, None] * up
+    filtered = np.empty_like(horizontal)
+    cuts = np.r_[0, np.flatnonzero(np.diff(t) > 0.0150001) + 1, len(t)]
+    for start, end in zip(cuts[:-1], cuts[1:]):
+        filtered[start:end] = smooth(horizontal[start:end], 0.3, sample_rate(t[start:end]))
+    strength = np.linalg.norm(filtered, axis=1)
+    first = None
+    onset = None
+    for i in range(len(t)):
+        if first is not None and i > 0 and t[i] - t[i - 1] > 0.0150001:
+            raise ValueError("Candidate launch hold crosses a recording gap; its onset is uncertain")
+        if (t[i] <= ref_start + ref_duration or strength[i] < threshold_g
+                or (i > 0 and t[i] - t[i - 1] > 0.0150001)):
+            first = None
+        if t[i] > ref_start + ref_duration and strength[i] >= threshold_g:
+            if first is None:
+                first = i
+            if t[i] - t[first] >= hold_s:
+                if np.mean(np.linalg.norm(horizontal[first:i + 1], axis=1) >= threshold_g) >= 0.5:
+                    onset = first
+                    break
+    if onset is None:
+        raise ValueError("No sustained acceleration found after the reference; lower the threshold or check the session")
+    end = int(np.searchsorted(t, t[onset] + window_s, side="right"))
+    if (t[-1] < t[onset] + window_s
+            or np.any(np.diff(t[onset:end]) > 0.0150001)):
+        raise ValueError("Launch averaging window is incomplete or crosses a recording gap")
+    vector = horizontal[onset:end].mean(axis=0)
+    norm = np.linalg.norm(vector)
+    if norm < threshold_g / 2:
+        raise ValueError("Launch direction cancels within the averaging window; inspect a shorter window")
+    direction = vector / norm
+    options = []
+    for axis in DEVICE_AXES:
+        d = np.asarray(DEVICE_AXES[axis])
+        projected = d - np.dot(d, up) * up
+        if np.linalg.norm(projected) >= 0.3:
+            options.append((np.dot(projected / np.linalg.norm(projected), direction), axis))
+    _score, axis = max(options)
+    base = calibrate(t, acc, ref_start, ref_duration, axis)
+    yaw = float(np.degrees(np.arctan2(np.dot(direction, base.left),
+                                      np.dot(direction, base.forward))))
+    return {"time_s": float(t[onset]), "axis": axis, "yaw_deg": yaw,
+            "vector_g": vector, "horizontal_g": strength, "reference": reference,
+            "up": up, "reference_noise_g": float(np.linalg.norm(acc[mask].std(axis=0)) / G),
+            "window_end_s": float(t[onset] + window_s)}
+
+
 def summarize(t, kart_g):
     """Peak values (g) over the given samples. kart_g should already be smoothed."""
     if len(t) == 0:

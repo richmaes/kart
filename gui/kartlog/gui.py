@@ -14,7 +14,9 @@ from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.widgets import SpanSelector  # noqa: E402
 import numpy as np  # noqa: E402
 
-from . import analysis, data, device, gyrocal, laps, laptimes, path, sensorcal, synth  # noqa: E402
+from . import alignment, analysis, data, device, gyrocal, laps, laptimes, path, sensorcal, synth  # noqa: E402
+from .alignment_dialog import AlignmentDialog  # noqa: E402
+from .launch_dialog import LaunchDialog  # noqa: E402
 from .photo_import import PhotoImportDialog  # noqa: E402
 
 RECORDINGS_DIR = Path(__file__).resolve().parent.parent / "recordings"
@@ -43,6 +45,7 @@ class App(tk.Tk):
         self.session_index = None
         self.recording_path = None
         self.external_times = {}
+        self.alignments = {}
         self.external_time_drafts = {}
         self._loading_external_times = False
         self._path_estimated = False
@@ -112,7 +115,24 @@ class App(tk.Tk):
         return box
 
     def _build_controls(self, parent):
-        frame = ttk.Frame(parent, padding=6, width=330)
+        container = ttk.Frame(parent)
+        self.controls_canvas = tk.Canvas(container, highlightthickness=0, width=330,
+                                         background=self.cget("background"), yscrollincrement=20)
+        self.controls_scrollbar = ttk.Scrollbar(
+            container, orient=tk.VERTICAL, command=self.controls_canvas.yview)
+        self.controls_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.controls_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        frame = ttk.Frame(self.controls_canvas, padding=6, width=330)
+        window = self.controls_canvas.create_window(0, 0, window=frame, anchor=tk.NW)
+
+        def resize(_event=None):
+            width = max(frame.winfo_reqwidth(), self.controls_canvas.winfo_width())
+            height = max(frame.winfo_reqheight(), self.controls_canvas.winfo_height())
+            self.controls_canvas.itemconfigure(window, width=width, height=height)
+            self.controls_canvas.configure(scrollregion=(0, 0, width, height))
+
+        frame.bind("<Configure>", resize)
+        self.controls_canvas.bind("<Configure>", resize)
 
         sens = ttk.LabelFrame(frame, text="Sensor calibration (per unit)", padding=6)
         sens.pack(fill=tk.X, pady=(0, 6))
@@ -151,7 +171,7 @@ class App(tk.Tk):
         mount = ttk.LabelFrame(frame, text="Mounting", padding=6)
         mount.pack(fill=tk.X, pady=6)
         ttk.Label(mount, text="Forward axis").grid(row=0, column=0, sticky=tk.W)
-        self.forward_var = tk.StringVar(value="+X")
+        self.forward_var = tk.StringVar(value="+Z")
         fwd = ttk.Combobox(mount, textvariable=self.forward_var, values=list(analysis.DEVICE_AXES),
                            width=6, state="readonly")
         fwd.grid(row=0, column=1, sticky=tk.W)
@@ -162,6 +182,8 @@ class App(tk.Tk):
             row=2, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
         ttk.Label(mount, text="Kart frame: +long = accelerating,\n+lat = turning left, vert = 1 g at rest",
                   foreground="gray").grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+        ttk.Button(mount, text="Inspect launch...", command=self.inspect_launch).grid(
+            row=4, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
 
         disp = ttk.LabelFrame(frame, text="Display", padding=6)
         disp.pack(fill=tk.X)
@@ -176,7 +198,32 @@ class App(tk.Tk):
         self.summary = tk.Text(summ, width=38, height=22, font=("Menlo", 10), relief=tk.FLAT,
                                background=self.cget("background"))
         self.summary.pack(fill=tk.BOTH, expand=True)
-        return frame
+        # A sidebar-only tag runs before widget classes (e.g. Spinbox/Combobox).
+        tag = f"SidebarWheel:{self.controls_canvas}"
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_class(tag, sequence, self._scroll_controls)
+
+        def bind_wheel(widget):
+            widget.bindtags((tag, *widget.bindtags()))
+            for child in widget.winfo_children():
+                bind_wheel(child)
+
+        bind_wheel(container)
+        return container
+
+    def _scroll_controls(self, event):
+        if getattr(event, "num", None) in (4, 5):
+            units = -1 if event.num == 4 else 1
+        else:
+            delta = event.delta
+            if not delta:
+                return "break"
+            if self.tk.call("tk", "windowingsystem") == "aqua":
+                units = -int(delta)
+            else:
+                units = -int(delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+        self.controls_canvas.yview_scroll(units, "units")
+        return "break"
 
     def _figure_tab(self, notebook, title):
         tab = ttk.Frame(notebook)
@@ -420,7 +467,7 @@ class App(tk.Tk):
             "Use seconds, e.g. 42.310, or m:ss.cc, e.g. 1:02.310 (up to three decimals). "
             "Leave unused trailing laps blank.\n"
             "Printed decimal places are reporting resolution, not guaranteed accuracy. These times are NOT "
-            "aligned to sensor timestamps and do not change manually marked lap boundaries."
+            "aligned until you use Auto-align laps and confirm a preview."
         ), wraplength=1000, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 8))
         self.external_times_title = tk.StringVar()
         ttk.Label(tab, textvariable=self.external_times_title).pack(anchor=tk.W)
@@ -460,6 +507,7 @@ class App(tk.Tk):
                                              command=self.save_external_times)
         self.external_times_save.pack(side=tk.LEFT)
         ttk.Button(actions, text="Import photo...", command=self.import_lap_photo).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Auto-align laps...", command=self.auto_align_laps).pack(side=tk.LEFT)
         ttk.Button(actions, text="Revert to saved", command=self._refresh_external_times).pack(
             side=tk.LEFT, padx=8)
         ttk.Button(actions, text="Clear entries", command=self._clear_external_times).pack(side=tk.LEFT)
@@ -474,6 +522,58 @@ class App(tk.Tk):
             self.external_time_drafts[str(self.session.number)] = [
                 variable.get() for variable in self.external_time_vars]
         self._preview_external_times()
+
+    def auto_align_laps(self):
+        try:
+            if self.session is None:
+                raise ValueError("Load a recording session first")
+            values = laptimes.parse_entries([v.get() for v in self.external_time_vars])
+            alignment.durations(values)
+            if self.session.gyro is None or not np.isfinite(self.session.gyro).any():
+                raise ValueError("Auto alignment needs a gyro-enabled recording")
+            if self.filtered_acc is None:
+                raise ValueError("Correct the acceleration filter settings before aligning")
+            AlignmentDialog(self, values)
+        except ValueError as exc:
+            messagebox.showerror("Auto alignment", str(exc), parent=self)
+
+    def apply_alignment(self, values, offset_s):
+        complete, _partial = alignment.boundaries(self.session, values, offset_s)
+        times = dict(self.external_times)
+        saved = dict(self.alignments)
+        number = str(self.session.number)
+        times[number] = list(values)
+        saved[number] = alignment.record(self.session, values, offset_s)
+        if self.recording_path is not None:
+            laptimes.save(self.recording_path, times, saved)
+        self.external_times = times
+        self.alignments = saved
+        self.laps = complete
+        self.laps_by_session[self.session_index] = complete
+        self._refresh_external_times()
+        self._refresh_lap_table()
+        self._draw_timeseries(reset_view=False)
+        self.status_var.set("Confirmed lap alignment applied. " + (
+            "Saved beside the recording." if self.recording_path is not None else
+            "In memory only; use Save CSV to persist it."))
+
+    def _forget_alignment(self):
+        """Detach manual edits before changing boundaries, including the disk copy."""
+        number = str(self.session.number)
+        if number not in self.alignments:
+            return True
+        saved = dict(self.alignments)
+        del saved[number]
+        try:
+            if self.recording_path is not None:
+                laptimes.save(self.recording_path, self.external_times, saved)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Remove saved alignment", str(exc), parent=self)
+            return False
+        self.alignments = saved
+        self._preview_external_times()
+        self.status_var.set("Manual boundary edit removed the saved auto alignment; manual edits are not persisted.")
+        return True
 
     def import_lap_photo(self):
         if self.session is None:
@@ -510,6 +610,9 @@ class App(tk.Tk):
             summary += f" Fastest: lap {values.index(best) + 1}, {laptimes.format_time(best)} s."
         saved = values == self.external_times.get(str(self.session.number), [])
         summary += " Saved." if saved else " Unsaved changes."
+        if str(self.session.number) in self.alignments:
+            summary += (" Confirmed alignment." if saved else
+                        " Editing durations; saving will remove the previous alignment.")
         summary += (f" Companion file: {laptimes.sidecar(self.recording_path).name}."
                     if self.recording_path is not None else
                     " No recording file; use Save CSV to keep lap times on disk.")
@@ -547,11 +650,19 @@ class App(tk.Tk):
             saved = dict(self.external_times)
             saved[str(self.session.number)] = values
             if self.recording_path is not None:
-                laptimes.save(self.recording_path, saved)
+                laptimes.save(self.recording_path, saved, self.alignments)
         except (OSError, ValueError) as exc:
             messagebox.showerror("Save lap times", str(exc), parent=self)
             return
         self.external_times = saved
+        number = str(self.session.number)
+        if number in self.alignments and self.alignments[number]["durations_ms"] != values:
+            del self.alignments[number]
+            self.laps = []
+            self.laps_by_session[self.session_index] = []
+            self._refresh_lap_table()
+            if self.filtered_acc is not None:
+                self._draw_timeseries(reset_view=False)
         self._refresh_external_times()
 
     def _confirm_discard_external_times(self):
@@ -670,12 +781,14 @@ class App(tk.Tk):
         try:
             sessions = data.load_csv(path)
             times = laptimes.load(path)
+            saved_alignments = laptimes.load_alignments(path)
             meta = sensorcal.read_meta(path)
         except Exception as exc:
             messagebox.showerror("Open CSV", str(exc))
             return
         self.set_sessions(sessions, Path(path).name, meta.get("serial"),
-                          recording_path=Path(path), external_times=times)
+                          recording_path=Path(path), external_times=times,
+                          alignments=saved_alignments)
 
     def save_csv(self):
         if not self.sessions:
@@ -696,14 +809,25 @@ class App(tk.Tk):
             Path(path).unlink(missing_ok=True)  # the dialog already confirmed overwrite
             data.save_csv(path, self.sessions)
             sensorcal.write_meta(path, **meta)
-            laptimes.save(path, times)
+            laptimes.save(path, times, self.alignments)
         except Exception as exc:
             messagebox.showerror("Save CSV", str(exc))
             return
         self.recording_path = Path(path)
         self.external_times = times
+        for index, session in enumerate(self.sessions):
+            number = str(session.number)
+            if number in self.alignments and self.alignments[number]["durations_ms"] != times.get(number):
+                self.laps_by_session[index] = []
+                if index == self.session_index:
+                    self.laps = []
+        self.alignments = {number: saved for number, saved in self.alignments.items()
+                           if saved["durations_ms"] == times.get(number)}
         self.external_time_drafts = {}
         self._refresh_external_times()
+        self._refresh_lap_table()
+        if self.filtered_acc is not None:
+            self._draw_timeseries(reset_view=False)
 
     def load_demo(self):
         previous_forward, previous_yaw = self.forward_var.get(), self.yaw_var.get()
@@ -714,12 +838,14 @@ class App(tk.Tk):
             self.forward_var.set(previous_forward)
             self.yaw_var.set(previous_yaw)
 
-    def set_sessions(self, sessions, source, serial=None, recording_path=None, external_times=None):
+    def set_sessions(self, sessions, source, serial=None, recording_path=None, external_times=None,
+                     alignments=None):
         """`serial` is the recording's unit; None means unknown (use the only stored unit)."""
         if not self._confirm_discard_external_times():
             return False
         self.recording_path = recording_path
         self.external_times = external_times if external_times is not None else {}
+        self.alignments = dict(alignments) if alignments is not None else {}
         self.external_time_drafts = {}
         self.sessions = sessions
         self.source = source
@@ -729,6 +855,18 @@ class App(tk.Tk):
         self.gyro_intervals = []
         self.laps = []
         self.session_index = None
+        stale = []
+        for index, session in enumerate(sessions):
+            number = str(session.number)
+            if number in self.alignments:
+                try:
+                    self.laps_by_session[index] = alignment.restore(
+                        session, self.external_times.get(number, []), self.alignments[number])
+                except ValueError as exc:
+                    stale.append(f"Session {number}: {exc}")
+                    del self.alignments[number]
+        if stale:
+            messagebox.showwarning("Saved lap alignment", "\n".join(stale), parent=self)
         if serial is None and len(self.store.units) == 1:
             serial = next(iter(self.store.units))
         self.select_unit(serial if serial in self.store.units else None, redraw=False)
@@ -763,11 +901,11 @@ class App(tk.Tk):
 
     def _select_lap(self, _event=None):
         selected = self.lap_tree.selection()
-        if not selected or self.session is None:
-            return
-        lap = self.laps[int(selected[0])]
-        self.lap_start_var.set(f"{lap.start_us / 1e6:.3f}")
-        self.lap_end_var.set(f"{lap.end_us / 1e6:.3f}")
+        if selected and self.session is not None and int(selected[0]) < len(self.laps):
+            lap = self.laps[int(selected[0])]
+            self.lap_start_var.set(f"{lap.start_us / 1e6:.3f}")
+            self.lap_end_var.set(f"{lap.end_us / 1e6:.3f}")
+        self._draw_lap_comparison()
 
     def _lap_from_entries(self, include=True):
         try:
@@ -785,6 +923,8 @@ class App(tk.Tk):
             laps.validate(self.session, lap, self.laps)
         except ValueError as exc:
             messagebox.showerror("Add lap", str(exc))
+            return
+        if not self._forget_alignment():
             return
         self.laps.append(lap)
         self.laps.sort(key=lambda item: item.start_us)
@@ -804,6 +944,8 @@ class App(tk.Tk):
         except ValueError as exc:
             messagebox.showerror("Update lap", str(exc))
             return
+        if not self._forget_alignment():
+            return
         self.laps[index] = updated
         self.laps.sort(key=lambda item: item.start_us)
         self._refresh_lap_table()
@@ -813,6 +955,8 @@ class App(tk.Tk):
     def remove_lap(self):
         selected = self.lap_tree.selection()
         if not selected:
+            return
+        if not self._forget_alignment():
             return
         del self.laps[int(selected[0])]
         self._refresh_lap_table()
@@ -828,6 +972,7 @@ class App(tk.Tk):
         lap = self.laps[int(row)]
         lap.include = not lap.include
         self._refresh_lap_table()
+        self.lap_tree.selection_set(row)
         self._draw_lap_comparison()
 
     def _refresh_lap_table(self):
@@ -837,7 +982,7 @@ class App(tk.Tk):
         for index, lap in enumerate(self.laps):
             flags = ", ".join(laps.flags(self.session, lap, self.laps)) or "—"
             self.lap_tree.insert("", tk.END, iid=str(index), values=(
-                index + 1, f"{lap.start_us / 1e6:.3f}", f"{lap.end_us / 1e6:.3f}",
+                lap.external_number or index + 1, f"{lap.start_us / 1e6:.3f}", f"{lap.end_us / 1e6:.3f}",
                 f"{lap.duration_s:.2f}", "✓" if lap.include else "",
                 flags))
         self._draw_lap_comparison()
@@ -847,7 +992,7 @@ class App(tk.Tk):
             return
         for ax in self.lap_axes:
             ax.clear()
-        included = [(i + 1, lap) for i, lap in enumerate(self.laps) if lap.include]
+        included = [(lap.external_number or i + 1, lap) for i, lap in enumerate(self.laps) if lap.include]
         if self.session is None or self.kart is None or not included:
             self.lap_axes[1].text(0.5, 0.5, "Select laps to compare",
                                   ha="center", va="center", transform=self.lap_axes[1].transAxes)
@@ -855,6 +1000,11 @@ class App(tk.Tk):
             self.lap_canvas.draw_idle()
             return
         mode = self.lap_mode_var.get()
+        selected = self.lap_tree.selection()
+        highlighted = None
+        if selected and int(selected[0]) < len(self.laps):
+            index = int(selected[0])
+            highlighted = self.laps[index].external_number or index + 1
         try:
             result = laps.comparison(self.session, self.kart, included, mode)
         except ValueError as exc:
@@ -865,8 +1015,12 @@ class App(tk.Tk):
         names = ("longitudinal", "lateral", "vertical")
         for axis_index, (ax, name) in enumerate(zip(self.lap_axes, names)):
             for curve_index, (number, x, values) in enumerate(result["curves"]):
-                ax.plot(x, values[:, axis_index], lw=0.8, alpha=0.35,
-                        label=f"Lap {number}" if axis_index == 0 and curve_index < 12 else None)
+                is_selected = number == highlighted
+                style = ({"color": "#ff0000", "lw": 2.5, "alpha": 1.0, "zorder": 5}
+                         if is_selected else {"lw": 0.8, "alpha": 0.35})
+                ax.plot(x, values[:, axis_index], **style,
+                        label=f"Lap {number}" if axis_index == 0
+                        and (curve_index < 12 or is_selected) else None)
             ax.fill_between(result["x"], result["low"][:, axis_index],
                             result["high"][:, axis_index], color="black", alpha=0.15,
                             label="25–75% range" if axis_index == 0 else None)
@@ -1011,6 +1165,12 @@ class App(tk.Tk):
             self.kart = None
         self._draw_timeseries(reset_view)
         self._draw_lap_comparison()
+
+    def inspect_launch(self):
+        if self.session is None:
+            messagebox.showinfo("Launch inspection", "Load a recording session first.", parent=self)
+            return
+        LaunchDialog(self)
 
     def auto_yaw(self):
         if self.session is None or self.cal is None:

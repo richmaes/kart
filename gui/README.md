@@ -35,6 +35,11 @@ version control.
 
 ## Workflow
 
+The left controls sidebar has a vertical scrollbar. Scroll with the mouse wheel
+or trackpad while pointing anywhere over the sidebar, including its controls.
+Wheel scrolling moves the sidebar rather than changing spinbox/combobox values;
+plot scrolling outside the sidebar is unaffected.
+
 1. **Download**: stop the logger, plug in USB, pick the port (it is auto-selected
    when it reports as *Thingy53 Accelerometer Logger*) and press **Download**.
    The transfer is read-only and validates CRCs like `logger.py`. Every download
@@ -49,7 +54,10 @@ version control.
    device tilt, and warns when the window looks like the kart was moving. With
    **Scale so reference reads 1 g** on (the default), every reading is scaled by
    1/|g_ref| to cancel the sensor's gain error.
-4. **Mounting**: choose which device axis points roughly forward. It is projected
+4. **Mounting**: choose which device axis points roughly forward (default **+Z**,
+   yaw trim **0°**, for the current kart mounting). Up is determined from the
+   stationary reference, not hardcoded; the current mounting reads approximately
+   **−Y** up. Demo data retains its own mounting setup. The forward axis is projected
    onto the level plane, so a tilted mount is fine. **Auto yaw from launch** finds
    the first sustained acceleration after the reference window. It assumes that
    is a straight-line pull-away and sets the yaw trim so that direction becomes
@@ -65,6 +73,11 @@ version control.
    variability band. Choose **Elapsed time** to preserve real timing differences,
    or **Lap progress** to align each lap from 0–100%.
 
+Select a lap's table row to highlight its acceleration curves in bright red with
+a thicker line on all three comparison plots. Other laps remain faint; the
+median and variability band are unchanged. A lap excluded from the overlay is
+not plotted until you enable its Overlay selection.
+
 Lap boundaries are manual and apply to the selected recording session. The table
 flags laps touching a recording edge, containing sample gaps over 15 ms, or
 lasting more than 20% away from the median when at least three laps are defined.
@@ -79,6 +92,30 @@ nine-column CSVs. Downloads and CSV saves preserve available gyro and BMI270 die
 temperature values; missing legacy values stay blank in mixed recordings.
 Acceleration plots and lap comparison still use acceleration only.
 
+## Inspecting idle to first major acceleration
+
+Under **Mounting**, click **Inspect launch...** for the selected session. The
+inspector uses the current stationary reference and finds the first sustained
+horizontal acceleration after it, independent of the current forward-axis sign.
+Adjust the reference start/duration, acceleration threshold (default 0.12 g),
+hold time (0.3 s) and direction-averaging window (1 s), then **Find / refresh**.
+
+The view zooms to five seconds before the candidate and five seconds after its
+averaging window. It shows calibrated device XYZ changes relative to idle,
+current longitudinal/lateral acceleration, the detection magnitude, and initial-up
+versus total acceleration magnitude. Reference and launch windows are shaded;
+the plot toolbar allows zooming/panning back through the idle period.
+
+The suggested signed forward axis and yaw assume a **straight forward launch**.
+Neither quiet data nor the first acceleration proves rest or forward motion:
+handling, braking, tilt and turns can produce false candidates. Inspect the traces
+and apply only after confirmation. Applying updates mounting and reference
+settings, never raw samples. Threshold edits invalidate the suggestion until
+refreshed. Detection uses calibrated raw data with a separate 0.3 s moving average
+and does not bridge gaps; it is independent of the display low-pass. The displayed
+onset is approximate, not an exact motion-start timestamp. Fixed-reference gravity
+projection does not compensate subsequent pitch/roll.
+
 ## Track-system lap times
 
 Open **Track lap times** and select the recording session in the toolbar.
@@ -90,7 +127,8 @@ fastest lap. Printed decimal places represent the timing system's reporting reso
 not guaranteed measurement accuracy.
 
 Click **Save session lap times** to write `<recording>.laptimes.json` beside the
-CSV. Times are stored as exact integer milliseconds (sidecar version 2), keyed by recording session
+CSV. Times are stored as exact integer milliseconds (sidecar version 2, or version 3
+with confirmed alignments), keyed by recording session
 number, separately from unit metadata and sensor calibration. Switching sessions
 retains unfinished edits. **Revert to saved** discards edits for the current
 session; **Clear entries** clears them, and saving commits that removal.
@@ -103,18 +141,67 @@ data, use Save CSV to persist times. The GUI warns before abandoning unsaved edi
 on closing or loading another recording. Invalid entries or file-write failures
 are reported explicitly.
 
-These durations are **not yet synchronized with sensor timestamps**. Cumulative
+These durations are **not synchronized until you confirm an alignment**. Cumulative
 time starts at the timing sequence's arbitrary zero, not sensor recording start.
 Timing laps may extend beyond the captured sensor data; they are not rejected for
-that reason. The manual Lap comparison boundaries remain unchanged. Automatic
-offset matching, physical start-line identification, and visual comparisons
-across multiple sessions/recordings are future work; this page stores the per-session
-timing data needed for them.
+that reason. Entering/importing times alone leaves manual Lap comparison boundaries
+unchanged. Use the alignment workflow below to propose sensor boundaries.
+Physical start-line identification cannot be guaranteed from IMU patterns;
+comparisons across multiple sessions/recordings remain future work.
 
 Existing version-1 sidecars containing hundredths load automatically as equivalent
 milliseconds (e.g. `4231` becomes `42310`, still 42.31 seconds). The original file
 is not rewritten until saving, which writes version 2. Displayed durations use
 three decimals; that does not imply millisecond accuracy.
+
+### Auto-aligning lap times to sensor data
+
+1. Load a **gyro-enabled** recording and enter/import at least **two lap durations**
+   on **Track lap times**. Three or more usable laps provide stronger evidence.
+   Correct any invalid acceleration-filter setting first. Click **Auto-align laps...**.
+2. Optionally enter an **Approx. crossing (s)**, its **Timing lap** number and a
+   **Search ± (s)** radius (default 2 s). This crossing is the **start** of the
+   specified timing lap, in the same seconds shown on the time-series plot.
+   For example, the start of lap 3 is after durations 1 and 2. Leave crossing blank
+   to search all offsets, including a recording that starts partway through racing.
+3. Click **Find candidates**. Search runs in the background. Choose among up to five
+   ranked offsets, inspect the boundary overview and normalized-progress overlays,
+   and adjust **timing lap 1 start** if necessary. Negative offsets mean timing
+   began before the captured recording. Click **Preview offset** after edits.
+4. Click **Apply confirmed boundaries** and confirm replacement of existing
+   Lap comparison boundaries. This also saves the entered durations and confirmed
+   offset in the recording's `.laptimes.json`; for in-memory recordings use **Save CSV**.
+   Only complete laps become comparison boundaries, with their original timing
+   lap numbers. Partial edge laps are reported, not clipped into misleading full laps.
+   Gap/missing-gyro laps are excluded from comparison overlays by default.
+
+Matching compares **ordered, signed native-axis gyro signatures** at normalized
+lap progress, with acceleration as supporting evidence. A short 0.15 s gyro
+moving average is used only for matching and never crosses gaps or missing-data
+runs. Removing each lap's gyro mean rejects constant bias; it is not a calibrated
+absolute heading or drift correction. Acceleration uses the current vibration
+low-pass input, without the additional display-smoothing control. Per-lap
+normalization tolerates amplitude differences but does not warp individual
+corners or stretch the timing-system clock.
+
+Scores combine mean pairwise pattern correlation and usable-lap coverage;
+they are **not confidence probabilities or guaranteed timing accuracy**. Search
+requires two complete, gap-free laps with varying gyro signals, and explicitly
+reports insufficient/no consistent matches. Repeated identical laps can produce
+many good offsets, including offsets at an arbitrary corner rather than the
+physical timing line. Ambiguous alternatives are flagged; use a crossing anchor
+and visual review. Differences in lap durations, incomplete overlap, spins,
+changing corner techniques and clock drift can weaken or mislead matching.
+No sensor-only method can prove the timing-line location.
+
+Reopening the CSV restores confirmed boundaries. **Save CSV** copies matching
+alignments for all sessions. A timestamp fingerprint guards against attaching an
+alignment to a different time series. Saving changed durations removes that
+session's old alignment and generated boundaries. Manual add/update/remove edits
+detach the saved auto alignment before changing boundaries (manual boundaries
+remain in memory only). Include/exclude checkboxes are comparison selections,
+not persisted alignment edits. Raw samples, calibration and external durations
+are not modified by the search.
 
 ### Importing lap times from a photo
 

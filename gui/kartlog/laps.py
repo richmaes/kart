@@ -12,6 +12,7 @@ class Lap:
     start_us: int
     end_us: int
     include: bool = True
+    external_number: int | None = None
 
     @property
     def duration_s(self):
@@ -63,6 +64,9 @@ def flags(session, lap, all_laps):
     gap_count = int(np.count_nonzero(gaps > GAP_LIMIT_US))
     if gap_count:
         result.append(f"{gap_count} gap{'s' if gap_count != 1 else ''} >15 ms")
+    if lap.external_number is not None and session.gyro is not None:
+        if not np.isfinite(session.gyro[max(0, first - 1):last + 1]).all():
+            result.append("missing gyro")
 
     if len(all_laps) >= 3:
         median = float(np.median([item.duration_s for item in all_laps]))
